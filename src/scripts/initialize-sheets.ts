@@ -24,7 +24,7 @@ const SHEET_NAME = 'Projects';
 
 // Expected columns structure
 const EXPECTED_COLUMNS = [
-  "id", "level", "projectName", "projectDescription", "projectVision", 
+  "id", "level", "projectName","test", "projectDescription", "projectVision", 
   "projectLinks", "referralSource", "scientificReferences", "credentialLinks", 
   "teamMembers", "motivation", "progress", 
   "id (Discord)", "serverId", "serverName", "invitationUrl",
