@@ -76,3 +76,6 @@ node_modules/*
 node_modules
 
 
+dump_postgres_to_supabase.sh
+supabase_clean_20250624_230619.sql
+supabase_dump_20250624_230619.sql

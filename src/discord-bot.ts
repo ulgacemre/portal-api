@@ -269,10 +269,32 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 // ---------------------------
 
+// Rate limit monitoring and cleanup
+setInterval(() => {
+  const now = Date.now();
+  let activeTrackers = 0;
+  let expiredTrackers = 0;
+  
+  // Clean up old rate limit trackers (older than 1 hour)
+  for (const [key, tracker] of rateLimitTrackers.entries()) {
+    if (now - tracker.lastCall > 3600000) { // 1 hour in milliseconds
+      rateLimitTrackers.delete(key);
+      expiredTrackers++;
+    } else {
+      activeTrackers++;
+    }
+  }
+  
+  if (expiredTrackers > 0) {
+    console.log(`[RATE_LIMIT_CLEANUP] Cleaned up ${expiredTrackers} expired rate limit trackers. Active: ${activeTrackers}`);
+  }
+}, 300000); // Run every 5 minutes
+
 // Handle bot ready event
 client.once(Events.ClientReady, async () => {
   console.log(`BioDAO Bot logged in as ${client.user?.tag}`);
   console.log(`Serving ${client.guilds.cache.size} guilds`);
+  console.log(`🛡️ Rate limiting system active - protecting against Discord API limits`);
 
   // Verify the bot's permissions for critical features
   verifyBotPermissions();
@@ -480,6 +502,10 @@ async function initializeGuildStats(guild: Guild): Promise<void> {
   console.log(`[DEBUG] Will sync messages: ${SYNC_RECENT_MESSAGES === 'true' && discordRecord ? 'YES' : 'NO'}`);
   
   if (SYNC_RECENT_MESSAGES === 'true' && discordRecord) {
+    // Check emergency brake before bulk message syncing
+    if (!(await EmergencyRateLimitBrake.checkBeforeOperation('syncRecentMessages'))) {
+      console.warn(`[MESSAGE_SYNC] Message sync skipped for guild ${guild.name} due to emergency mode`);
+    } else {
     try {
       console.log(`[MESSAGE_SYNC] Starting message sync for the last 12 hours in ${guild.name}...`);
       
@@ -537,15 +563,29 @@ async function initializeGuildStats(guild: Guild): Promise<void> {
       let totalPapersFound = 0;
       const MESSAGE_FETCH_LIMIT = 50; // Reasonable limit per channel to avoid rate limits
       
-      // Process each channel
+      // Process each channel with rate limiting
       for (const [channelId, channel] of textChannels) {
         try {
           console.log(`[MESSAGE_SYNC] Fetching messages from channel #${(channel as TextChannel).name} (${channelId})...`);
           
-          // Fetch recent messages
-          const messages = await (channel as TextChannel).messages.fetch({ 
-            limit: MESSAGE_FETCH_LIMIT 
-          });
+          // Apply rate limiting before fetching messages
+          await DiscordRateLimiter.bulkChannelFetch();
+          await DiscordRateLimiter.messageFetch(channelId);
+          
+          // Fetch recent messages with safe operation
+          const messages = await safeDiscordOperation(
+            () => (channel as TextChannel).messages.fetch({ 
+              limit: MESSAGE_FETCH_LIMIT 
+            }),
+            `Fetch messages from channel #${(channel as TextChannel).name}`,
+            `message_fetch_${channelId}`
+          );
+          
+          if (!messages) {
+            console.warn(`[MESSAGE_SYNC] Failed to fetch messages from channel #${(channel as TextChannel).name}, skipping`);
+            continue;
+          }
+          
           console.log(`[DEBUG] Fetched ${messages.size} messages from channel #${(channel as TextChannel).name}`);
           
           // Filter to messages within the last 24 hours and not from bots
@@ -681,8 +721,11 @@ async function initializeGuildStats(guild: Guild): Promise<void> {
               // Non-critical error, can continue
             }
 
-            // Add sync to Google Sheets after updating historical stats
+            // Add sync to Google Sheets after updating historical stats with rate limiting
+            await DiscordRateLimiter.sheetsSync(`messagesCount_${guild.id}`);
             await syncDiscordStatsToSheets(guild.id, 'messagesCount', stats.messageCount);
+            
+            await DiscordRateLimiter.sheetsSync(`papersShared_${guild.id}`);
             await syncDiscordStatsToSheets(guild.id, 'papersShared', stats.papersShared);
           } catch (updateError) {
             console.error(`[DEBUG] Failed to update DB with new counts:`, updateError);
@@ -696,6 +739,7 @@ async function initializeGuildStats(guild: Guild): Promise<void> {
     } catch (syncError) {
       console.error(`[MESSAGE_SYNC] Error syncing messages for ${guild.name}:`, syncError);
     }
+    } // Close the emergency brake else block
   }
   
   // Notify API and schedule quality evaluation
@@ -860,8 +904,8 @@ client.on(Events.GuildMemberAdd, async (member: GuildMember) => {
           }
         }
 
-        // Send welcome DM to the new member to collect LinkedIn/profile information
-        await sendWelcomeDMToNewMember(member, discordRecord, project);
+        // Send welcome message to the new member in private channel to collect LinkedIn/profile information
+        await sendWelcomeToNewMember(member, discordRecord, project);
       } else {
         console.log(`[MEMBER_JOIN] No founders found for project ${discordRecord.projectId}`);
       }
@@ -891,9 +935,10 @@ client.on(Events.MessageCreate, async (message: Message) => {
   // Ignore bot messages
   if (message.author.bot) return;
   
-  // Handle DM responses for user profile collection
-  if (message.channel.type === ChannelType.DM) {
-    await processDMResponse(message);
+  // Handle channel responses for user profile collection (onboarding channels or DMs)
+  if (message.channel.type === ChannelType.DM || 
+      (message.channel.type === ChannelType.GuildText && message.channel.name.startsWith('onboarding-'))) {
+    await processChannelResponse(message);
     return;
   }
   
@@ -949,8 +994,13 @@ client.on(Events.MessageCreate, async (message: Message) => {
               }
             });
             
-            // Replace reply with emoji reaction
-            await message.react('📄'); // Paper emoji reaction
+            // Replace reply with emoji reaction using rate limiting
+            await DiscordRateLimiter.reactionAdd(message.id);
+            await safeDiscordOperation(
+              () => message.react('📄'), // Paper emoji reaction
+              'Add PDF reaction',
+              `reaction_add_${message.id}`
+            );
             console.log(`[PDF_PROCESS] Successfully logged PDF: ${attachment.name} for project ${discordRecord.projectId}`);
           } catch (uploadError) {
             console.error(`[PDF_PROCESS] Error processing PDF: ${attachment.name}`, uploadError);
@@ -992,7 +1042,8 @@ client.on(Events.MessageCreate, async (message: Message) => {
         });
         console.log(`[PAPER_TRACK] Updated paper count in DB for guild ${guildId}`);
         
-        // Add direct sync to Google Sheets for just the papers count
+        // Add direct sync to Google Sheets for just the papers count with rate limiting
+        await DiscordRateLimiter.sheetsSync(`papersShared_update_${guildId}`);
         await syncDiscordStatsToSheets(guildId, 'papersShared', updatedStats.papersShared);
       }
     } catch (dbError) {
@@ -1025,7 +1076,8 @@ client.on(Events.MessageCreate, async (message: Message) => {
         });
         console.log(`[MESSAGE_TRACK] Updated message count in DB for guild ${guildId}`);
         
-        // Add direct sync to Google Sheets for just the message count
+        // Add direct sync to Google Sheets for just the message count with rate limiting
+        await DiscordRateLimiter.sheetsSync(`messagesCount_update_${guildId}`);
         await syncDiscordStatsToSheets(guildId, 'messagesCount', updatedStats.messageCount);
       }
     } catch (dbError) {
@@ -1058,7 +1110,8 @@ client.on(Events.MessageCreate, async (message: Message) => {
       await notifyPortalAPI(guildId, 'stats_update');
       console.log(`[API_NOTIFY] Portal API notified for guild ${guildId} stats update`);
       
-      // Add sync to Google Sheets
+      // Add sync to Google Sheets with rate limiting
+      await DiscordRateLimiter.sheetsSync(`milestone_sync_${guildId}`);
       await syncDiscordStatsToSheets(guildId);
     } catch (apiError) {
       console.error(`[API_NOTIFY] Error notifying Portal API:`, apiError);
@@ -1236,7 +1289,7 @@ function setupPersistentResponseCollector(userId: string, guildId: string): void
 }
 
 // --- REPLACE sendWelcomeDMToNewMember ---
-async function sendWelcomeDMToNewMember(member: GuildMember, discordRecord: any, project: any): Promise<void> {
+async function sendWelcomeToNewMember(member: GuildMember, discordRecord: any, project: any): Promise<void> {
   // Setup collector first
   setupPersistentResponseCollector(member.user.id, member.guild.id);
 
@@ -1245,7 +1298,7 @@ async function sendWelcomeDMToNewMember(member: GuildMember, discordRecord: any,
   if (profile) {
       profile.onboardingStep = 1;
   } else {
-      console.error(`[WELCOME_DM] Profile not found for ${member.user.id} after setup. Initializing robustly.`);
+      console.error(`[WELCOME_CHANNEL] Profile not found for ${member.user.id} after setup. Initializing robustly.`);
       userProfileCollections.set(member.user.id, {
           userId: member.user.id,
           guildId: member.guild.id,
@@ -1257,7 +1310,7 @@ async function sendWelcomeDMToNewMember(member: GuildMember, discordRecord: any,
       profile = userProfileCollections.get(member.user.id)!;
       if (profile) {
           profile.onboardingStep = 1;
-          console.log(`[PROFILE] Force-initialized profile and set step for ${member.user.id} in sendWelcomeDMToNewMember.`);
+          console.log(`[PROFILE] Force-initialized profile and set step for ${member.user.id} in sendWelcomeToNewMember.`);
       } else {
           console.error(`[PROFILE] CRITICAL: Failed to retrieve profile for ${member.user.id} even after force-initialization.`);
           return; // Cannot proceed if profile is not set up
@@ -1265,7 +1318,15 @@ async function sendWelcomeDMToNewMember(member: GuildMember, discordRecord: any,
   }
 
   try {
-    const welcomeText = `👋 Welcome to **${project.projectName || member.guild.name}**! We're excited to have you.\n\nTo help us understand your interests and how you'd like to contribute, please select an option below:`;
+    // Create or find private onboarding channel for this user
+    const onboardingChannel = await createOrFindOnboardingChannel(member);
+    
+    if (!onboardingChannel) {
+      console.error(`[WELCOME_CHANNEL] Failed to create/find onboarding channel for ${member.user.tag}`);
+      return;
+    }
+
+    const welcomeText = `👋 Welcome to **${project.projectName || member.guild.name}**, ${member.user.username}! We're excited to have you.\n\nThis is your private onboarding channel. To help us understand your interests and how you'd like to contribute, please select an option below:`;
 
     const scientistButton = new ButtonBuilder()
       .setCustomId('onboarding_scientist')
@@ -1290,22 +1351,127 @@ async function sendWelcomeDMToNewMember(member: GuildMember, discordRecord: any,
     const row = new ActionRowBuilder<ButtonBuilder>()
       .addComponents(scientistButton, developerButton, communityButton, web3Button);
 
-    await member.send({ content: welcomeText, components: [row] });
-    console.log(`[WELCOME_DM] Sent welcome DM with buttons to new member ${member.user.tag} (${member.user.id})`);
+    // Send message with rate limiting
+    await DiscordRateLimiter.messageSend(onboardingChannel.id);
+    const messageResult = await safeDiscordOperation(
+      () => onboardingChannel.send({ content: welcomeText, components: [row] }),
+      'Send welcome message',
+      `message_send_${onboardingChannel.id}`
+    );
+    
+    if (messageResult) {
+      console.log(`[WELCOME_CHANNEL] Sent welcome message with buttons to new member ${member.user.tag} (${member.user.id}) in channel ${onboardingChannel.name}`);
+    } else {
+      console.error(`[WELCOME_CHANNEL] Failed to send welcome message to ${member.user.tag}`);
+    }
 
   } catch (error) {
-    console.error(`[WELCOME_DM] Error sending welcome DM with buttons to ${member.user.tag} (${member.user.id}):`, error);
+    console.error(`[WELCOME_CHANNEL] Error sending welcome message with buttons to ${member.user.tag} (${member.user.id}):`, error);
+    // Fallback to general welcome channel
     const welcomeChannel = member.guild.channels.cache.find(
       (ch) => ch.type === ChannelType.GuildText && ch.name.toLowerCase().includes('welcome')
     ) as TextChannel | undefined;
     if (welcomeChannel) {
       try {
-        await welcomeChannel.send(`👋 Welcome <@${member.user.id}>! I tried to send you a DM with some options to start your onboarding, but it seems your DMs might be closed. Please check your server privacy settings and then DM me directly to begin!`);
-        console.log(`[WELCOME_DM] Sent fallback welcome message in #${welcomeChannel.name} for ${member.user.tag} due to DM failure.`);
+        await welcomeChannel.send(`👋 Welcome <@${member.user.id}>! I tried to create a private onboarding channel for you, but encountered an issue. Please contact a server admin to help with your onboarding process.`);
+        console.log(`[WELCOME_CHANNEL] Sent fallback welcome message in #${welcomeChannel.name} for ${member.user.tag} due to channel creation failure.`);
       } catch (fallbackError) {
-        console.error(`[WELCOME_DM] Failed to send fallback welcome message in #${welcomeChannel?.name}:`, fallbackError);
+        console.error(`[WELCOME_CHANNEL] Failed to send fallback welcome message in #${welcomeChannel?.name}:`, fallbackError);
       }
     }
+  }
+}
+
+// Create or find private onboarding channel for a user
+async function createOrFindOnboardingChannel(member: GuildMember): Promise<TextChannel | null> {
+  try {
+    const guild = member.guild;
+    const channelName = `onboarding-${member.user.username.toLowerCase().replace(/[^a-z0-9]/g, '')}-${member.user.id.slice(-4)}`;
+    
+    // First, try to find existing channel
+    const existingChannel = guild.channels.cache.find(
+      (ch) => ch.name === channelName && ch.type === ChannelType.GuildText
+    ) as TextChannel | undefined;
+    
+    if (existingChannel) {
+      console.log(`[ONBOARDING_CHANNEL] Found existing channel: ${channelName}`);
+      return existingChannel;
+    }
+
+    // Apply rate limiting before channel creation
+    await DiscordRateLimiter.channelCreate(guild.id);
+    console.log(`[ONBOARDING_CHANNEL] Creating new channel: ${channelName}`);
+    
+    // Find or create onboarding category with rate limiting
+    let onboardingCategory = guild.channels.cache.find(
+      (ch) => ch.name === 'Onboarding' && ch.type === ChannelType.GuildCategory
+    );
+    
+    if (!onboardingCategory) {
+      console.log(`[ONBOARDING_CHANNEL] Creating onboarding category`);
+      // Apply additional rate limiting for category creation
+      await DiscordRateLimiter.channelCreate(guild.id);
+      
+      const createdCategory = await safeDiscordOperation(
+        () => guild.channels.create({
+          name: 'Onboarding',
+          type: ChannelType.GuildCategory,
+          permissionOverwrites: [
+            {
+              id: guild.roles.everyone.id,
+              deny: ['ViewChannel'],
+            },
+          ],
+        }),
+        'Create onboarding category',
+        `channel_create_category_${guild.id}`
+      );
+      
+      if (!createdCategory) {
+        console.error(`[ONBOARDING_CHANNEL] Failed to create onboarding category`);
+        return null;
+      }
+      
+      onboardingCategory = createdCategory;
+    }
+
+    // Create the private channel with rate limiting and safe operation
+    const channel = await safeDiscordOperation(
+      () => guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        parent: onboardingCategory?.id || null,
+        topic: `Private onboarding channel for ${member.user.tag}`,
+        permissionOverwrites: [
+          {
+            id: guild.roles.everyone.id,
+            deny: ['ViewChannel'],
+          },
+          {
+            id: member.user.id,
+            allow: ['ViewChannel', 'SendMessages', 'ReadMessageHistory'],
+          },
+          {
+            id: client.user?.id || '',
+            allow: ['ViewChannel', 'SendMessages', 'ReadMessageHistory', 'ManageMessages'],
+          },
+        ],
+      }),
+      'Create private onboarding channel',
+      `channel_create_${guild.id}`
+    );
+
+    if (channel) {
+      console.log(`[ONBOARDING_CHANNEL] Created private channel: ${channelName} for ${member.user.tag}`);
+      return channel as TextChannel;
+    } else {
+      console.error(`[ONBOARDING_CHANNEL] Failed to create private channel for ${member.user.tag}`);
+      return null;
+    }
+    
+  } catch (error) {
+    console.error(`[ONBOARDING_CHANNEL] Error creating/finding onboarding channel for ${member.user.tag}:`, error);
+    return null;
   }
 }
 
@@ -1400,7 +1566,7 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     
     // Ask for credentials
     let prompt = '';
-    const nextStepPrompt = "\n\nPlease reply to this message with the requested information. If you don't have something, you can type 'skip'.";
+    const nextStepPrompt = "\n\nPlease reply in this channel with the requested information. If you don't have something, you can type 'skip'.";
     switch (profileData.contributorType) {
       case 'scientist':
         prompt = `🔬 **Scientist/Researcher Profile**\nTo help us connect you with relevant opportunities, please share any of the following:\n• Your **LinkedIn** profile URL\n• Your **Google Scholar** profile URL\n• Your **ORCID** iD or profile URL\n• Links to any key **research papers, projects, or your ResearchGate** profile.` + nextStepPrompt;
@@ -1415,26 +1581,30 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
         prompt = `🌐 **Web3 Enthusiast Profile**\nWe're glad to have your interest in Web3! Please share:\n• Your **LinkedIn** profile URL (if you have one)\n• Your **Twitter (X)** profile URL (if you have one)\n• A brief description of your **interests in Web3, or any projects/DAOs you follow or are part of**.` + nextStepPrompt;
         break;
     }
-    // Send the credential prompt as a new message in the DM channel
+    // Send the credential prompt as a new message in the channel
     try {
-        const dmChannel = await interaction.user.createDM();
-        await dmChannel.send(prompt);
-        console.log(`[INTERACTION_HANDLER] Sent credential prompt to ${userId} for type ${profileData.contributorType}.`);
-    } catch (dmError) {
-        console.error(`[INTERACTION_HANDLER] Failed to send credential prompt DM to ${userId}:`, dmError);
-        // If DM fails, try to use ephemeral follow-up, though it might be too long.
+        await interaction.followUp({ content: prompt });
+        console.log(`[INTERACTION_HANDLER] Sent credential prompt to ${userId} for type ${profileData.contributorType} in channel.`);
+    } catch (channelError) {
+        console.error(`[INTERACTION_HANDLER] Failed to send credential prompt to ${userId} in channel:`, channelError);
+        // Try to use ephemeral follow-up as fallback
         try {
-            await interaction.followUp({ content: `There was an issue DMing you the next step. Please ensure your DMs are open. The next step is: ${prompt}`, ephemeral: true });
+            await interaction.followUp({ content: `There was an issue sending the next step. The next step is: ${prompt}`, ephemeral: true });
         } catch (e) { /* ignore, already logged */ }
     }
   }
 });
 
-// Modify processDMResponse to primarily handle steps 2 and 3, 
+// Modify processChannelResponse to primarily handle steps 2 and 3, 
 // as step 1 (contributor type) is now handled by button interaction.
 // However, if a user types during step 1 instead of clicking, we can still process it.
-async function processDMResponse(message: Message): Promise<void> {
-  if (message.channel.type !== ChannelType.DM || message.author.bot) return;
+async function processChannelResponse(message: Message): Promise<void> {
+  // Check if this is in an onboarding channel or DM
+  const isOnboardingChannel = message.channel.type === ChannelType.GuildText && 
+                             message.channel.name.startsWith('onboarding-');
+  const isDM = message.channel.type === ChannelType.DM;
+  
+  if ((!isOnboardingChannel && !isDM) || message.author.bot) return;
 
   const userId = message.author.id;
   let profileData = userProfileCollections.get(userId);
@@ -1472,10 +1642,10 @@ async function processDMResponse(message: Message): Promise<void> {
     userProfileCollections.set(userId, profileData); // Save the updated profile
 
     // Do NOT send buttons here if it's a new profile. 
-    // The GuildMemberAdd event (sendWelcomeDMToNewMember) is responsible for sending buttons.
-    // If the user DMs first, they will get a text prompt.
+    // The GuildMemberAdd event (sendWelcomeToNewMember) is responsible for sending buttons.
+    // If the user messages first, they will get a text prompt.
     await message.reply("Hello! To get started with your onboarding, please tell me how you would self-identify. For example, you can type:\n• `Scientist`\n• `Developer`\n• `Community Builder`\n• `Web3 Enthusiast`");
-    console.log(`[PROCESS_DM] Sent text-based initial prompt to user ${userId} (updated for Web3 Enthusiast).`);
+    console.log(`[PROCESS_CHANNEL] Sent text-based initial prompt to user ${userId} (updated for Web3 Enthusiast).`);
     return; 
   }
 
@@ -1484,7 +1654,7 @@ async function processDMResponse(message: Message): Promise<void> {
 
   // --- Step 1: Contributor Type (Text Input) ---
   if (profileData.onboardingStep === 1) {
-    console.log(`[PROCESS_DM_STEP1_TEXT] User ${userId} (guildId: ${profileData.guildId || 'N/A'}) typed for step 1: "${content}"`);
+    console.log(`[PROCESS_CHANNEL_STEP1_TEXT] User ${userId} (guildId: ${profileData.guildId || 'N/A'}) typed for step 1: "${content}"`);
     const type = content.toLowerCase();
     if (type.includes('scientist') || type.includes('researcher')) profileData.contributorType = 'scientist';
     else if (type.includes('developer') || type.includes('engineer') || type.includes('dev')) profileData.contributorType = 'developer';
@@ -1494,7 +1664,7 @@ async function processDMResponse(message: Message): Promise<void> {
         // If none of the keywords match, default to web3_enthusiast but use their text as description
         profileData.contributorType = 'web3_enthusiast'; 
         profileData.description = content; // User's original text becomes description for this catch-all
-        console.log(`[PROCESS_DM_STEP1_TEXT] User ${userId} typed "${content}", defaulted to web3_enthusiast, description set to input.`);
+        console.log(`[PROCESS_CHANNEL_STEP1_TEXT] User ${userId} typed "${content}", defaulted to web3_enthusiast, description set to input.`);
     } 
     // If it's a recognized type (not the else block above), set description to the type itself for consistency
     if (profileData.description !== content && profileData.contributorType !== 'web3_enthusiast') {
@@ -1531,7 +1701,7 @@ async function processDMResponse(message: Message): Promise<void> {
 
     // Updated credential prompts to match interaction handler
     let prompt = '';
-    const nextStepPrompt = "\n\nPlease reply to this message with the requested information. If you don't have something, you can type 'skip'.";
+    const nextStepPrompt = "\n\nPlease reply in this channel with the requested information. If you don't have something, you can type 'skip'.";
     switch (profileData.contributorType) {
       case 'scientist':
         prompt = `🔬 **Scientist/Researcher Profile**\nTo help us connect you with relevant opportunities, please share any of the following:\n• Your **LinkedIn** profile URL\n• Your **Google Scholar** profile URL\n• Your **ORCID** iD or profile URL\n• Links to any key **research papers, projects, or your ResearchGate** profile.` + nextStepPrompt;
@@ -1556,14 +1726,14 @@ async function processDMResponse(message: Message): Promise<void> {
     const lower = content.toLowerCase();
     let found = false;
     
-    console.log(`[PROCESS_DM_STEP2] User ${userId} provided: "${content}"`);
+    console.log(`[PROCESS_CHANNEL_STEP2] User ${userId} provided: "${content}"`);
     
     // Enhanced LinkedIn detection
     if (content.match(/linkedin\.com\//i)) {
       const linkedinUrl = content.match(/https?:\/\/(www\.)?linkedin\.com\/in\/[\w\-]+/i)?.[0] || content;
       profileData.credentials.linkedin = linkedinUrl;
       found = true;
-      console.log(`[PROCESS_DM_STEP2] Detected LinkedIn: ${linkedinUrl}`);
+      console.log(`[PROCESS_CHANNEL_STEP2] Detected LinkedIn: ${linkedinUrl}`);
     }
     
     // Enhanced GitHub detection
@@ -1571,7 +1741,7 @@ async function processDMResponse(message: Message): Promise<void> {
       const githubUrl = content.match(/https?:\/\/(www\.)?github\.com\/[\w\-]+/i)?.[0] || content;
       profileData.credentials.github = githubUrl;
       found = true;
-      console.log(`[PROCESS_DM_STEP2] Detected GitHub: ${githubUrl}`);
+      console.log(`[PROCESS_CHANNEL_STEP2] Detected GitHub: ${githubUrl}`);
     }
     
     // Enhanced Google Scholar detection
@@ -1579,7 +1749,7 @@ async function processDMResponse(message: Message): Promise<void> {
       const scholarUrl = content.match(/https?:\/\/(www\.)?scholar\.google\.com\/[\w\-\/?=&]+/i)?.[0] || content;
       profileData.credentials.scholar = scholarUrl;
       found = true;
-      console.log(`[PROCESS_DM_STEP2] Detected Google Scholar: ${scholarUrl}`);
+      console.log(`[PROCESS_CHANNEL_STEP2] Detected Google Scholar: ${scholarUrl}`);
     }
     
     // Enhanced ORCID detection
@@ -1587,7 +1757,7 @@ async function processDMResponse(message: Message): Promise<void> {
       const orcidUrl = content.match(/https?:\/\/(www\.)?orcid\.org\/[\d\-X]+/i)?.[0] || content;
       profileData.credentials.orcid = orcidUrl;
       found = true;
-      console.log(`[PROCESS_DM_STEP2] Detected ORCID: ${orcidUrl}`);
+      console.log(`[PROCESS_CHANNEL_STEP2] Detected ORCID: ${orcidUrl}`);
     }
     
     // Enhanced Twitter detection (including x.com)
@@ -1595,7 +1765,7 @@ async function processDMResponse(message: Message): Promise<void> {
       const twitterUrl = content.match(/https?:\/\/(www\.)?(twitter\.com|x\.com)\/[\w\-]+/i)?.[0] || content;
       profileData.credentials.twitter = twitterUrl;
       found = true;
-      console.log(`[PROCESS_DM_STEP2] Detected Twitter/X: ${twitterUrl}`);
+      console.log(`[PROCESS_CHANNEL_STEP2] Detected Twitter/X: ${twitterUrl}`);
     }
     
     // ResearchGate detection
@@ -1608,7 +1778,7 @@ async function processDMResponse(message: Message): Promise<void> {
         profileData.credentials.other = researchgateUrl;
       }
       found = true;
-      console.log(`[PROCESS_DM_STEP2] Detected ResearchGate: ${researchgateUrl}`);
+      console.log(`[PROCESS_CHANNEL_STEP2] Detected ResearchGate: ${researchgateUrl}`);
     }
     
     // Scientific paper URLs detection
@@ -1663,7 +1833,7 @@ async function processDMResponse(message: Message): Promise<void> {
     // Handle "skip" command
     if (content.toLowerCase() === 'skip') {
       found = true;
-      console.log(`[PROCESS_DM_STEP2] User ${userId} skipped credential entry`);
+      console.log(`[PROCESS_CHANNEL_STEP2] User ${userId} skipped credential entry`);
     }
     
     // If at least one credential or description, move to next step
@@ -1674,9 +1844,9 @@ async function processDMResponse(message: Message): Promise<void> {
       // Save progress to database immediately
       try {
         await saveUserProfileToDatabase(profileData);
-        console.log(`[PROCESS_DM_STEP2] Saved credentials to database for user ${userId}`);
+        console.log(`[PROCESS_CHANNEL_STEP2] Saved credentials to database for user ${userId}`);
       } catch (saveError) {
-        console.error(`[PROCESS_DM_STEP2] Error saving credentials to database:`, saveError);
+        console.error(`[PROCESS_CHANNEL_STEP2] Error saving credentials to database:`, saveError);
       }
       
       await message.reply(`✅ Got it! Your information has been added.\n\nType **'done'** if you have nothing more to add, or provide another link/credential.`);
@@ -1694,28 +1864,28 @@ async function processDMResponse(message: Message): Promise<void> {
       // Final save to database with complete profile
       try {
         await saveUserProfileToDatabase(profileData);
-        console.log(`[PROCESS_DM_STEP3] Final save completed for user ${userId}`);
+        console.log(`[PROCESS_CHANNEL_STEP3] Final save completed for user ${userId}`);
       } catch (saveError) {
-        console.error(`[PROCESS_DM_STEP3] Error in final save:`, saveError);
+        console.error(`[PROCESS_CHANNEL_STEP3] Error in final save:`, saveError);
       }
       
-      await message.reply(`🎉 **Onboarding Complete!** Thank you for sharing your information.\n\nOur team will review your profile. You can update your info anytime by DMing me again with new links or details.\n\nWelcome to the community!`);
+      await message.reply(`🎉 **Onboarding Complete!** Thank you for sharing your information.\n\nOur team will review your profile. You can update your info anytime by messaging me again in this channel with new links or details.\n\nWelcome to the community!`);
       
       // Notify founders about the completed profile
       try {
         await notifyFoundersAboutNewMemberProfile(profileData);
-        console.log(`[PROCESS_DM_STEP3] Notified founders about completed profile for user ${userId}`);
+        console.log(`[PROCESS_CHANNEL_STEP3] Notified founders about completed profile for user ${userId}`);
       } catch (notifyError) {
-        console.error(`[PROCESS_DM_STEP3] Error notifying founders:`, notifyError);
+        console.error(`[PROCESS_CHANNEL_STEP3] Error notifying founders:`, notifyError);
       }
       
       return;
     } else {
       // Allow adding more credentials - go back to step 2 processing
-      console.log(`[PROCESS_DM_STEP3] User ${userId} adding additional credential: "${content}"`);
+      console.log(`[PROCESS_CHANNEL_STEP3] User ${userId} adding additional credential: "${content}"`);
       profileData.onboardingStep = 2;
       userProfileCollections.set(userId, profileData);
-      await processDMResponse(message); // Recurse to handle as step 2
+      await processChannelResponse(message); // Recurse to handle as step 2
       return;
     }
   }
@@ -2124,6 +2294,9 @@ async function notifyPortalAPI(
 ): Promise<void> {
   console.log(`[PORTAL_API] Attempting to notify for guild ${guildId}, event: ${eventType}`);
   try {
+    // Apply rate limiting for Portal API calls
+    await DiscordRateLimiter.portalApi(`${eventType}_${guildId}`);
+    
     const guild = client.guilds.cache.get(guildId);
     if (!guild) {
       console.warn(`Cannot update stats: Guild ${guildId} not found`);
@@ -2161,9 +2334,46 @@ async function notifyPortalAPI(
       endpoint = '/api/discord/stats-update';
       console.log(`Updating stats for ${guild.name}: ${JSON.stringify(payload)}`);
     }
-    // Send to API
-    const response = await axios.post(`${PORTAL_API_URL}${endpoint}`, payload);
-    console.log(`[PORTAL_API] Successfully notified for guild ${guildId}, event: ${eventType}. Response: ${response.status}`);
+    
+    // Send to API with retry logic
+    let retryCount = 0;
+    const maxRetries = 3;
+    
+    while (retryCount <= maxRetries) {
+      try {
+        const response = await axios.post(`${PORTAL_API_URL}${endpoint}`, payload, {
+          timeout: 10000, // 10 second timeout
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'BioDAO-Discord-Bot/1.0'
+          }
+        });
+        
+        console.log(`[PORTAL_API] Successfully notified for guild ${guildId}, event: ${eventType}. Response: ${response.status}`);
+        return; // Success, exit function
+        
+      } catch (apiError: any) {
+        retryCount++;
+        
+        // Check if we should retry
+        const shouldRetry = (
+          (apiError.code === 'ECONNRESET' || 
+           apiError.code === 'ETIMEDOUT' || 
+           apiError.code === 'ECONNREFUSED' ||
+           (apiError.response && apiError.response.status >= 500)) &&
+          retryCount <= maxRetries
+        );
+        
+        if (shouldRetry) {
+          const backoffTime = Math.pow(2, retryCount - 1) * 1000; // Exponential backoff
+          console.warn(`[PORTAL_API] API call failed (attempt ${retryCount}/${maxRetries}), retrying in ${backoffTime}ms...`);
+          await sleep(backoffTime);
+        } else {
+          throw apiError; // Re-throw if we shouldn't retry
+        }
+      }
+    }
+    
   } catch (error: any) { // Catching error as any
     console.error(`[PORTAL_API_ERROR] Failed to notify Portal API for guild ${guildId}, event: ${eventType}. Error: ${error.message}`);
     if (error.response) {
@@ -2175,9 +2385,8 @@ async function notifyPortalAPI(
     } else {
       console.error('[PORTAL_API_ERROR_SETUP]', 'Error setting up the request:', error.message);
     }
-    // Re-throw the error if you want the caller (GuildMemberAdd) to handle it further or stop execution.
-    // For now, we log it and let GuildMemberAdd continue.
-    // throw error; // Uncomment if this API call is absolutely critical to halt further GMANewMember logic
+    // Don't throw error to prevent cascading failures
+    // Log and continue with bot operations
   }
 }
 
@@ -2237,7 +2446,8 @@ function evaluateMessageQuality(guildId: string): void {
           });
           console.log(`[QUALITY_UPDATE] Updated quality score in DB for guild ${guildId}`);
           
-          // Sync only the quality score to Google Sheets
+          // Sync only the quality score to Google Sheets with rate limiting
+          await DiscordRateLimiter.sheetsSync(`qualityScore_${guildId}`);
           await syncDiscordStatsToSheets(guildId, 'qualityScore', Math.round(stats.qualityScore));
         }
       } catch (error) {
@@ -2283,6 +2493,13 @@ async function initDiscordBot(): Promise<Client> {
   console.log('[Discord Bot] Client login initiated');
   return client;
 }
+
+// Export emergency brake functions for external usage
+export const emergencyControls = {
+  activateEmergencyMode: (durationMs?: number) => EmergencyRateLimitBrake.activateEmergencyMode(durationMs),
+  isEmergencyMode: () => EmergencyRateLimitBrake.isEmergencyMode(),
+  checkBeforeOperation: (operationType: string) => EmergencyRateLimitBrake.checkBeforeOperation(operationType)
+};
 
 export { initDiscordBot };
 
@@ -2772,12 +2989,12 @@ async function extractEnhancedPaperMetadata(url: string, content?: string): Prom
   return metadata;
 }
 
-// Add this function after the existing sendWelcomeDMToNewMember function
-async function sendWelcomeDMToExistingMember(member: GuildMember, discordRecord: any, project: any): Promise<boolean> {
+// Add this function after the existing sendWelcomeToNewMember function
+async function sendWelcomeToExistingMember(member: GuildMember, discordRecord: any, project: any): Promise<boolean> {
   // Check if user already has a profile or has completed onboarding
   const existingProfile = userProfileCollections.get(member.user.id);
   if (existingProfile && existingProfile.isComplete) {
-    console.log(`[EXISTING_WELCOME_DM] User ${member.user.id} already has a profile and has completed onboarding`);
+    console.log(`[EXISTING_WELCOME_CHANNEL] User ${member.user.id} already has a profile and has completed onboarding`);
     return false; // Already completed
   }
 
@@ -2794,7 +3011,7 @@ async function sendWelcomeDMToExistingMember(member: GuildMember, discordRecord:
       return false; // Already completed onboarding in database
     }
   } catch (error) {
-    console.log(`[EXISTING_WELCOME_DM] Could not check database for user ${member.user.id}, proceeding with DM`);
+    console.log(`[EXISTING_WELCOME_CHANNEL] Could not check database for user ${member.user.id}, proceeding with channel creation`);
   }
 
   // Setup collector first
@@ -2816,7 +3033,15 @@ async function sendWelcomeDMToExistingMember(member: GuildMember, discordRecord:
   }
 
   try {
-    const welcomeText = `👋 Hello **${member.user.username}**! We've enhanced our community with a new contributor profiling system for **${project.projectName || member.guild.name}**!\n\n🎯 This helps us:\n• Connect you with relevant opportunities\n• Better understand our community\n• Provide personalized experiences\n\nTo get started, please select your primary area of interest:`;
+    // Create or find private onboarding channel for this user
+    const onboardingChannel = await createOrFindOnboardingChannel(member);
+    
+    if (!onboardingChannel) {
+      console.error(`[EXISTING_WELCOME_CHANNEL] Failed to create/find onboarding channel for ${member.user.tag}`);
+      return false;
+    }
+
+    const welcomeText = `👋 Hello **${member.user.username}**! We've enhanced our community with a new contributor profiling system for **${project.projectName || member.guild.name}**!\n\n🎯 This helps us:\n• Connect you with relevant opportunities\n• Better understand our community\n• Provide personalized experiences\n\nThis is your private onboarding channel. To get started, please select your primary area of interest:`;
 
     const scientistButton = new ButtonBuilder()
       .setCustomId('onboarding_scientist')
@@ -2841,19 +3066,25 @@ async function sendWelcomeDMToExistingMember(member: GuildMember, discordRecord:
     const row = new ActionRowBuilder<ButtonBuilder>()
       .addComponents(scientistButton, developerButton, communityButton, web3Button);
 
-    await member.send({ content: welcomeText, components: [row] });
-    console.log(`[EXISTING_WELCOME_DM] Sent welcome DM to existing member ${member.user.tag} (${member.user.id})`);
+    await onboardingChannel.send({ content: welcomeText, components: [row] });
+    console.log(`[EXISTING_WELCOME_CHANNEL] Sent welcome message to existing member ${member.user.tag} (${member.user.id}) in channel ${onboardingChannel.name}`);
     return true;
 
   } catch (error) {
-    console.error(`[EXISTING_WELCOME_DM] Error sending welcome DM to existing member ${member.user.tag} (${member.user.id}):`, error);
+    console.error(`[EXISTING_WELCOME_CHANNEL] Error sending welcome message to existing member ${member.user.tag} (${member.user.id}):`, error);
     return false;
   }
 }
 
-// Add this function to automatically process existing members
+// Add this function to automatically process existing members with enhanced rate limiting
 async function processExistingMembersForGuild(guild: Guild): Promise<void> {
   console.log(`[AUTO_WELCOME] Processing existing members for guild ${guild.name} (${guild.id})`);
+  
+  // Check emergency brake before starting bulk operations
+  if (!(await EmergencyRateLimitBrake.checkBeforeOperation('processExistingMembersForGuild'))) {
+    console.warn(`[AUTO_WELCOME] Bulk member processing skipped for guild ${guild.name} due to emergency mode`);
+    return;
+  }
   
   try {
     // Fetch the project data from database
@@ -2877,40 +3108,73 @@ async function processExistingMembersForGuild(guild: Guild): Promise<void> {
       return;
     }
 
-    // Fetch all members
-    await guild.members.fetch();
-    const members = guild.members.cache.filter(member => !member.user.bot);
+    // Fetch all members with rate limiting
+    await DiscordRateLimiter.memberFetch(guild.id);
+    const fetchResult = await safeDiscordOperation(
+      () => guild.members.fetch(),
+      'Fetch guild members',
+      `member_fetch_${guild.id}`
+    );
     
+    if (!fetchResult) {
+      console.error(`[AUTO_WELCOME] Failed to fetch members for guild ${guild.id}`);
+      return;
+    }
+    
+    const members = guild.members.cache.filter(member => !member.user.bot);
     console.log(`[AUTO_WELCOME] Found ${members.size} non-bot members in guild ${guild.name}`);
 
-    // Process members gradually to avoid rate limits
+    // Enhanced rate limiting for bulk operations
     let processedCount = 0;
     let successCount = 0;
-    const delayBetweenMembers = 1000; // 1 second between each member
+    const maxConcurrentProcessing = 3; // Process max 3 members concurrently
+    const memberEntries = Array.from(members.entries());
+    
+    // Process members in batches to avoid overwhelming the system
+    for (let i = 0; i < memberEntries.length; i += maxConcurrentProcessing) {
+      const batch = memberEntries.slice(i, i + maxConcurrentProcessing);
+      
+      console.log(`[AUTO_WELCOME] Processing batch ${Math.floor(i / maxConcurrentProcessing) + 1}/${Math.ceil(memberEntries.length / maxConcurrentProcessing)} (${batch.length} members)`);
+      
+      // Process batch members concurrently but with individual rate limiting
+      const batchPromises = batch.map(async ([userId, member]) => {
+        try {
+          // Apply bulk processing rate limiting
+          await DiscordRateLimiter.bulkMemberProcess();
+          
+          const sent = await sendWelcomeToExistingMember(member, discordRecord, discordRecord.project);
+          if (sent) {
+            return { success: true, member };
+          }
+          return { success: false, member };
+        } catch (error) {
+          console.error(`[AUTO_WELCOME] Error processing member ${member.user.tag}:`, error);
+          return { success: false, member, error };
+        }
+      });
 
-    for (const [userId, member] of members) {
-      try {
-        const sent = await sendWelcomeDMToExistingMember(member, discordRecord, discordRecord.project);
-        if (sent) {
+      // Wait for batch to complete
+      const batchResults = await Promise.allSettled(batchPromises);
+      
+      // Count results
+      batchResults.forEach((result) => {
+        processedCount++;
+        if (result.status === 'fulfilled' && result.value.success) {
           successCount++;
         }
-        processedCount++;
+      });
 
-        // Log progress every 10 members
-        if (processedCount % 10 === 0) {
-          console.log(`[AUTO_WELCOME] Progress: ${processedCount}/${members.size} processed, ${successCount} DMs sent`);
-        }
-
-        // Add delay to respect rate limits
-        await new Promise(resolve => setTimeout(resolve, delayBetweenMembers));
-
-      } catch (error) {
-        console.error(`[AUTO_WELCOME] Error processing member ${member.user.tag}:`, error);
-        processedCount++;
+      // Log progress every batch
+      console.log(`[AUTO_WELCOME] Batch completed. Progress: ${processedCount}/${members.size} processed, ${successCount} channels created`);
+      
+      // Longer delay between batches to ensure rate limits are respected
+      if (i + maxConcurrentProcessing < memberEntries.length) {
+        console.log(`[AUTO_WELCOME] Waiting before next batch to respect rate limits...`);
+        await sleep(3000); // 3 second delay between batches
       }
     }
 
-    console.log(`[AUTO_WELCOME] Completed processing for guild ${guild.name}. Processed: ${processedCount}, DMs sent: ${successCount}`);
+    console.log(`[AUTO_WELCOME] ✅ Completed processing for guild ${guild.name}. Processed: ${processedCount}, Channels created: ${successCount}`);
 
   } catch (error) {
     console.error(`[AUTO_WELCOME] Error processing existing members for guild ${guild.id}:`, error);
@@ -3099,3 +3363,221 @@ async function runScientistMigration(): Promise<{ success: boolean, message: str
 
 // Export the migration function for running the backfill
 export { runScientistMigration, migrateExistingVerifiedScientists };
+
+// Add rate limiting imports and utilities
+import { setTimeout as sleep } from 'timers/promises';
+
+// Rate limiting configuration for Discord API
+const RATE_LIMITS = {
+  // Channel operations
+  CHANNEL_CREATE: 5000, // 5 seconds between channel creations
+  CHANNEL_UPDATE: 2000, // 2 seconds between channel updates
+  MESSAGE_FETCH: 1000,  // 1 second between message fetch operations
+  
+  // Member operations
+  MEMBER_FETCH: 500,    // 500ms between member fetches
+  MEMBER_UPDATE: 1000,  // 1 second between member updates
+  
+  // Message operations
+  MESSAGE_SEND: 1000,   // 1 second between message sends per channel
+  REACTION_ADD: 500,    // 500ms between reaction additions
+  
+  // External API calls
+  PORTAL_API: 2000,     // 2 seconds between Portal API calls
+  SHEETS_SYNC: 3000,    // 3 seconds between Sheets sync operations
+  
+  // Bulk operations
+  BULK_MEMBER_PROCESS: 5000, // 5 seconds between processing each member in bulk
+  BULK_CHANNEL_FETCH: 2000,  // 2 seconds between fetching from different channels
+};
+
+// Rate limiting state tracking
+interface RateLimitState {
+  lastCall: number;
+  callCount: number;
+  resetTime: number;
+}
+
+// Emergency rate limit brake system
+class EmergencyRateLimitBrake {
+  private static emergencyMode = false;
+  private static emergencyModeUntil = 0;
+  
+  static isEmergencyMode(): boolean {
+    if (this.emergencyMode && Date.now() > this.emergencyModeUntil) {
+      this.emergencyMode = false;
+      console.log(`[EMERGENCY_BRAKE] 🚦 Emergency mode deactivated - normal operations resumed`);
+    }
+    return this.emergencyMode;
+  }
+  
+  static activateEmergencyMode(durationMs: number = 300000): void { // Default 5 minutes
+    this.emergencyMode = true;
+    this.emergencyModeUntil = Date.now() + durationMs;
+    console.warn(`[EMERGENCY_BRAKE] 🚨 EMERGENCY MODE ACTIVATED - All non-critical operations paused for ${durationMs/1000}s`);
+  }
+  
+  static async checkBeforeOperation(operationType: string): Promise<boolean> {
+    if (this.isEmergencyMode()) {
+      console.warn(`[EMERGENCY_BRAKE] ⏸️ Operation ${operationType} skipped due to emergency mode`);
+      return false;
+    }
+    return true;
+  }
+}
+
+const rateLimitTrackers: Map<string, RateLimitState> = new Map();
+
+/**
+ * Advanced rate limiting utility with exponential backoff
+ */
+class DiscordRateLimiter {
+  static async waitForRateLimit(key: string, minDelay: number): Promise<void> {
+    const now = Date.now();
+    const tracker = rateLimitTrackers.get(key) || { lastCall: 0, callCount: 0, resetTime: now };
+    
+    // Calculate required delay
+    const timeSinceLastCall = now - tracker.lastCall;
+    const requiredDelay = Math.max(0, minDelay - timeSinceLastCall);
+    
+    if (requiredDelay > 0) {
+      console.log(`[RATE_LIMIT] Waiting ${requiredDelay}ms for ${key}`);
+      await sleep(requiredDelay);
+    }
+    
+    // Update tracker
+    tracker.lastCall = Date.now();
+    tracker.callCount++;
+    rateLimitTrackers.set(key, tracker);
+  }
+  
+  static async channelCreate(guildId: string): Promise<void> {
+    await this.waitForRateLimit(`channel_create_${guildId}`, RATE_LIMITS.CHANNEL_CREATE);
+  }
+  
+  static async channelUpdate(channelId: string): Promise<void> {
+    await this.waitForRateLimit(`channel_update_${channelId}`, RATE_LIMITS.CHANNEL_UPDATE);
+  }
+  
+  static async messageFetch(channelId: string): Promise<void> {
+    await this.waitForRateLimit(`message_fetch_${channelId}`, RATE_LIMITS.MESSAGE_FETCH);
+  }
+  
+  static async messageSend(channelId: string): Promise<void> {
+    await this.waitForRateLimit(`message_send_${channelId}`, RATE_LIMITS.MESSAGE_SEND);
+  }
+  
+  static async memberFetch(guildId: string): Promise<void> {
+    await this.waitForRateLimit(`member_fetch_${guildId}`, RATE_LIMITS.MEMBER_FETCH);
+  }
+  
+  static async memberUpdate(memberId: string): Promise<void> {
+    await this.waitForRateLimit(`member_update_${memberId}`, RATE_LIMITS.MEMBER_UPDATE);
+  }
+  
+  static async reactionAdd(messageId: string): Promise<void> {
+    await this.waitForRateLimit(`reaction_add_${messageId}`, RATE_LIMITS.REACTION_ADD);
+  }
+  
+  static async portalApi(operation: string): Promise<void> {
+    await this.waitForRateLimit(`portal_api_${operation}`, RATE_LIMITS.PORTAL_API);
+  }
+  
+  static async sheetsSync(operation: string): Promise<void> {
+    await this.waitForRateLimit(`sheets_sync_${operation}`, RATE_LIMITS.SHEETS_SYNC);
+  }
+  
+  static async bulkMemberProcess(): Promise<void> {
+    await this.waitForRateLimit('bulk_member_process', RATE_LIMITS.BULK_MEMBER_PROCESS);
+  }
+  
+  static async bulkChannelFetch(): Promise<void> {
+    await this.waitForRateLimit('bulk_channel_fetch', RATE_LIMITS.BULK_CHANNEL_FETCH);
+  }
+}
+
+/**
+ * Enhanced error handling for Discord API errors with exponential backoff
+ */
+async function handleDiscordApiError(error: any, operation: string, retryCount = 0): Promise<boolean> {
+  const maxRetries = 3;
+  
+  // Check if it's a rate limit error
+  if (error.code === 429 || (error.status >= 429 && error.status < 430)) {
+    const retryAfter = error.retry_after || Math.pow(2, retryCount) * 1000; // Exponential backoff
+    console.warn(`[RATE_LIMIT] ${operation} rate limited. Waiting ${retryAfter}ms before retry ${retryCount + 1}/${maxRetries}`);
+    
+    if (retryCount < maxRetries) {
+      await sleep(retryAfter);
+      return true; // Indicate we should retry
+    } else {
+      console.error(`[RATE_LIMIT] ${operation} failed after ${maxRetries} retries due to rate limiting`);
+      return false;
+    }
+  }
+  
+  // Check for other temporary errors
+  if (error.status >= 500 && error.status < 600 && retryCount < maxRetries) {
+    const backoffTime = Math.pow(2, retryCount) * 1000;
+    console.warn(`[RETRY] ${operation} failed with server error ${error.status}. Retrying in ${backoffTime}ms`);
+    await sleep(backoffTime);
+    return true;
+  }
+  
+  // For other errors, don't retry
+  console.error(`[ERROR] ${operation} failed with non-retryable error:`, error.message);
+  return false;
+}
+
+/**
+ * Safe wrapper for Discord API operations with automatic rate limiting and retry
+ */
+async function safeDiscordOperation<T>(
+  operation: () => Promise<T>,
+  operationName: string,
+  rateLimitKey?: string
+): Promise<T | null> {
+  // Check emergency brake first
+  if (!(await EmergencyRateLimitBrake.checkBeforeOperation(operationName))) {
+    return null; // Operation skipped due to emergency mode
+  }
+  
+  let retryCount = 0;
+  const maxRetries = 3;
+  
+  while (retryCount <= maxRetries) {
+    try {
+      // Apply rate limiting if key provided
+      if (rateLimitKey) {
+        await DiscordRateLimiter.waitForRateLimit(rateLimitKey, 1000);
+      }
+      
+      const result = await operation();
+      
+      // Reset retry count on success
+      if (retryCount > 0) {
+        console.log(`[RECOVERY] ${operationName} succeeded after ${retryCount} retries`);
+      }
+      
+      return result;
+    } catch (error) {
+      const shouldRetry = await handleDiscordApiError(error, operationName, retryCount);
+      
+      // If we hit multiple rate limit errors, consider emergency mode
+      if ((error as any).code === 429 && retryCount >= 2) {
+        console.warn(`[EMERGENCY_TRIGGER] Multiple rate limit hits detected for ${operationName} - considering emergency mode`);
+        EmergencyRateLimitBrake.activateEmergencyMode(180000); // 3 minutes
+      }
+      
+      if (shouldRetry && retryCount < maxRetries) {
+        retryCount++;
+        continue;
+      } else {
+        console.error(`[FAILED] ${operationName} failed permanently:`, error);
+        return null;
+      }
+    }
+  }
+  
+  return null;
+}

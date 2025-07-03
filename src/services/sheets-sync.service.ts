@@ -22,7 +22,7 @@ const GOOGLE_SHEETS_SCOPES = [
 // Define expected column structure as a constant
 // lastActivity is a timestamp showing when the project or its Discord data was last updated
 const EXPECTED_COLUMN_STRUCTURE = [
-  "id", "level", "projectName","test", "projectDescription", "projectVision", 
+  "id", "level", "projectName", "Test", "projectDescription", "projectVision", 
   "projectLinks", "referralSource", "scientificReferences", "credentialLinks", 
   "teamMembers", "motivation", "progress", 
   "id (Discord)", "serverId", "serverName", "invitationUrl",
@@ -277,12 +277,12 @@ function formatProjectToRow(record: any, discordRecord: any = null): any[] {
   const rowData = Array(EXPECTED_COLUMN_STRUCTURE.length).fill('');
   
   // Map project fields to the correct column positions
-  // First 12 columns are project data
+  // First 13 columns are project data
   const projectFields = [
     { column: "id", value: record.id || '' },
     { column: "level", value: record.level || '' },
     { column: "projectName", value: record.projectName || '' },
-    { column: "test" },
+    { column: "Test", value: record.test || '' }, // Test column - placeholder for future use
     { column: "projectDescription", value: record.projectDescription || '' },
     { column: "projectVision", value: record.projectVision || '' },
     { column: "projectLinks", value: record.projectLinks || '' },
