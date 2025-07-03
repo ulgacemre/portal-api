@@ -358,6 +358,18 @@ client.once(Events.ClientReady, async () => {
 
   // Set up periodic stats updates
   setInterval(updateAllGuildStats, 30 * 60 * 1000); // Update every 30 minutes
+
+  // Set up periodic cleanup of old onboarding channels
+  setInterval(async () => {
+    console.log('[SCHEDULED_CLEANUP] Running periodic onboarding channel cleanup...');
+    for (const [guildId, guild] of client.guilds.cache) {
+      try {
+        await cleanupOldOnboardingChannels(guild);
+      } catch (error) {
+        console.error(`[SCHEDULED_CLEANUP] Error cleaning up guild ${guild.name}:`, error);
+      }
+    }
+  }, 24 * 60 * 60 * 1000); // Run cleanup every 24 hours
 });
 
 /**
@@ -941,6 +953,21 @@ client.on(Events.MessageCreate, async (message: Message) => {
     await processChannelResponse(message);
     return;
   }
+
+  // Handle admin cleanup commands
+  if (message.content.startsWith('!cleanup-onboarding') && message.member?.permissions.has('ManageChannels')) {
+    await message.react('🧹');
+    await message.reply('🧹 Starting onboarding channel cleanup...');
+    
+    try {
+      await cleanupOldOnboardingChannels(message.guild!);
+      await message.reply('✅ Onboarding channel cleanup completed! Check logs for details.');
+    } catch (error) {
+      console.error('[MANUAL_CLEANUP] Error in manual cleanup:', error);
+      await message.reply('❌ Error occurred during cleanup. Check logs for details.');
+    }
+    return;
+  }
   
   const guildId = message.guild?.id;
   if (!guildId) return;
@@ -1382,7 +1409,7 @@ async function sendWelcomeToNewMember(member: GuildMember, discordRecord: any, p
   }
 }
 
-// Create or find private onboarding channel for a user
+// Create or find private onboarding channel for a user with smart category management
 async function createOrFindOnboardingChannel(member: GuildMember): Promise<TextChannel | null> {
   try {
     const guild = member.guild;
@@ -1402,37 +1429,11 @@ async function createOrFindOnboardingChannel(member: GuildMember): Promise<TextC
     await DiscordRateLimiter.channelCreate(guild.id);
     console.log(`[ONBOARDING_CHANNEL] Creating new channel: ${channelName}`);
     
-    // Find or create onboarding category with rate limiting
-    let onboardingCategory = guild.channels.cache.find(
-      (ch) => ch.name === 'Onboarding' && ch.type === ChannelType.GuildCategory
-    );
+    // Smart category management: find available onboarding category
+    const availableCategory = await findOrCreateAvailableOnboardingCategory(guild);
     
-    if (!onboardingCategory) {
-      console.log(`[ONBOARDING_CHANNEL] Creating onboarding category`);
-      // Apply additional rate limiting for category creation
-      await DiscordRateLimiter.channelCreate(guild.id);
-      
-      const createdCategory = await safeDiscordOperation(
-        () => guild.channels.create({
-          name: 'Onboarding',
-          type: ChannelType.GuildCategory,
-          permissionOverwrites: [
-            {
-              id: guild.roles.everyone.id,
-              deny: ['ViewChannel'],
-            },
-          ],
-        }),
-        'Create onboarding category',
-        `channel_create_category_${guild.id}`
-      );
-      
-      if (!createdCategory) {
-        console.error(`[ONBOARDING_CHANNEL] Failed to create onboarding category`);
-        return null;
-      }
-      
-      onboardingCategory = createdCategory;
+    if (!availableCategory) {
+      console.warn(`[ONBOARDING_CHANNEL] No available onboarding category found, creating channel without category`);
     }
 
     // Create the private channel with rate limiting and safe operation
@@ -1440,7 +1441,7 @@ async function createOrFindOnboardingChannel(member: GuildMember): Promise<TextC
       () => guild.channels.create({
         name: channelName,
         type: ChannelType.GuildText,
-        parent: onboardingCategory?.id || null,
+        parent: availableCategory?.id || null,
         topic: `Private onboarding channel for ${member.user.tag}`,
         permissionOverwrites: [
           {
@@ -1462,7 +1463,8 @@ async function createOrFindOnboardingChannel(member: GuildMember): Promise<TextC
     );
 
     if (channel) {
-      console.log(`[ONBOARDING_CHANNEL] Created private channel: ${channelName} for ${member.user.tag}`);
+      const categoryInfo = availableCategory ? `in category ${availableCategory.name}` : 'without category (all categories full)';
+      console.log(`[ONBOARDING_CHANNEL] ✅ Created private channel: ${channelName} for ${member.user.tag} ${categoryInfo}`);
       return channel as TextChannel;
     } else {
       console.error(`[ONBOARDING_CHANNEL] Failed to create private channel for ${member.user.tag}`);
@@ -1472,6 +1474,141 @@ async function createOrFindOnboardingChannel(member: GuildMember): Promise<TextC
   } catch (error) {
     console.error(`[ONBOARDING_CHANNEL] Error creating/finding onboarding channel for ${member.user.tag}:`, error);
     return null;
+  }
+}
+
+// Smart category management function
+async function findOrCreateAvailableOnboardingCategory(guild: Guild): Promise<any> {
+  const DISCORD_CATEGORY_CHANNEL_LIMIT = 50;
+  
+  try {
+    // Find all existing onboarding categories (Onboarding, Onboarding-2, Onboarding-3, etc.)
+    const onboardingCategories = guild.channels.cache.filter(
+      (ch) => ch.type === ChannelType.GuildCategory && 
+              (ch.name === 'Onboarding' || ch.name.startsWith('Onboarding-'))
+    );
+    
+    console.log(`[CATEGORY_MGMT] Found ${onboardingCategories.size} existing onboarding categories`);
+    
+    // Check each category to see if it has space
+    for (const [categoryId, category] of onboardingCategories) {
+      const channelsInCategory = guild.channels.cache.filter(
+        (ch) => ch.parentId === categoryId && ch.type === ChannelType.GuildText
+      );
+      
+      console.log(`[CATEGORY_MGMT] Category "${category.name}" has ${channelsInCategory.size}/${DISCORD_CATEGORY_CHANNEL_LIMIT} channels`);
+      
+      if (channelsInCategory.size < DISCORD_CATEGORY_CHANNEL_LIMIT) {
+        console.log(`[CATEGORY_MGMT] ✅ Using existing category "${category.name}" (${channelsInCategory.size}/50 channels)`);
+        return category;
+      }
+    }
+    
+    // All existing categories are full, create a new one
+    const nextCategoryNumber = onboardingCategories.size === 1 ? 2 : onboardingCategories.size + 1;
+    const newCategoryName = nextCategoryNumber === 2 ? 'Onboarding-2' : `Onboarding-${nextCategoryNumber}`;
+    
+    console.log(`[CATEGORY_MGMT] All categories full (${onboardingCategories.size} categories), creating new category: ${newCategoryName}`);
+    
+    // Apply rate limiting for category creation
+    await DiscordRateLimiter.channelCreate(guild.id);
+    
+    const newCategory = await safeDiscordOperation(
+      () => guild.channels.create({
+        name: newCategoryName,
+        type: ChannelType.GuildCategory,
+        permissionOverwrites: [
+          {
+            id: guild.roles.everyone.id,
+            deny: ['ViewChannel'],
+          },
+        ],
+      }),
+      'Create new onboarding category',
+      `channel_create_category_${guild.id}`
+    );
+    
+    if (newCategory) {
+      console.log(`[CATEGORY_MGMT] ✅ Created new category: ${newCategoryName}`);
+      return newCategory;
+    } else {
+      console.error(`[CATEGORY_MGMT] Failed to create new category: ${newCategoryName}`);
+      return null;
+    }
+    
+  } catch (error) {
+    console.error(`[CATEGORY_MGMT] Error in category management:`, error);
+    return null;
+  }
+}
+
+// Optional: Cleanup function to remove old empty onboarding channels
+async function cleanupOldOnboardingChannels(guild: Guild): Promise<void> {
+  try {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - 7); // 7 days old
+    
+    // Find all onboarding channels
+    const onboardingChannels = guild.channels.cache.filter(
+      (ch) => ch.type === ChannelType.GuildText && 
+              ch.name.startsWith('onboarding-')
+    );
+    
+    let deletedCount = 0;
+    const MAX_DELETIONS_PER_RUN = 5; // Limit deletions to avoid rate limits
+    
+    console.log(`[CLEANUP] Found ${onboardingChannels.size} onboarding channels to check`);
+    
+    for (const [channelId, channel] of onboardingChannels) {
+      if (deletedCount >= MAX_DELETIONS_PER_RUN) {
+        console.log(`[CLEANUP] Reached deletion limit (${MAX_DELETIONS_PER_RUN}), stopping cleanup`);
+        break;
+      }
+      
+      const textChannel = channel as TextChannel;
+      
+      // Check if channel is old and inactive
+      if (channel.createdAt && channel.createdAt < cutoffDate) {
+        try {
+          // Check if there are recent messages
+          await DiscordRateLimiter.messageFetch(channelId);
+          const messages = await safeDiscordOperation(
+            () => textChannel.messages.fetch({ limit: 1 }),
+            'Fetch recent messages for cleanup',
+            `cleanup_fetch_${channelId}`
+          );
+          
+          const hasRecentActivity = messages && messages.size > 0 && 
+                                  messages.first()!.createdAt > cutoffDate;
+          
+          if (!hasRecentActivity) {
+            // Safe to delete - old and no recent activity
+            await DiscordRateLimiter.channelUpdate(channelId);
+            const deleted = await safeDiscordOperation(
+              () => textChannel.delete('Cleanup: Old inactive onboarding channel'),
+              'Delete old onboarding channel',
+              `cleanup_delete_${channelId}`
+            );
+            
+            if (deleted) {
+              deletedCount++;
+              console.log(`[CLEANUP] ✅ Deleted old onboarding channel: ${channel.name}`);
+            }
+          }
+        } catch (cleanupError) {
+          console.error(`[CLEANUP] Error cleaning up channel ${channel.name}:`, cleanupError);
+        }
+      }
+    }
+    
+    if (deletedCount > 0) {
+      console.log(`[CLEANUP] ✅ Cleanup completed: ${deletedCount} old onboarding channels deleted`);
+    } else {
+      console.log(`[CLEANUP] No old channels found for cleanup`);
+    }
+    
+  } catch (error) {
+    console.error(`[CLEANUP] Error in cleanup process:`, error);
   }
 }
 
@@ -2501,7 +2638,7 @@ export const emergencyControls = {
   checkBeforeOperation: (operationType: string) => EmergencyRateLimitBrake.checkBeforeOperation(operationType)
 };
 
-export { initDiscordBot };
+export { initDiscordBot, cleanupOldOnboardingChannels };
 
 async function assignContributorRole(
   client: Client,
