@@ -75,6 +75,14 @@ interface GuildStats {
 
 const guildStats: Map<string, GuildStats> = new Map();
 
+// Configuration for onboarding behavior
+const ONBOARDING_CONFIG = {
+  RECENT_JOINER_DAYS: parseInt(process.env.ONBOARDING_RECENT_JOINER_DAYS || '7'), // Only process members who joined within this many days
+  MAX_CONCURRENT_PROCESSING: parseInt(process.env.ONBOARDING_MAX_CONCURRENT || '3'), // Maximum members to process concurrently
+  BATCH_DELAY_MS: parseInt(process.env.ONBOARDING_BATCH_DELAY_MS || '3000'), // Delay between batches to respect rate limits
+  MAX_CHANNELS_PER_GUILD: parseInt(process.env.ONBOARDING_MAX_CHANNELS_PER_GUILD || '100'), // Maximum onboarding channels to create per guild (safety limit)
+};
+
 // Enhanced paper detection keywords and patterns
 const PAPER_KEYWORDS = [
   'research paper',
@@ -968,6 +976,57 @@ client.on(Events.MessageCreate, async (message: Message) => {
     }
     return;
   }
+
+  // Handle admin onboarding settings commands
+  if (message.content.startsWith('!onboarding-settings') && message.member?.permissions.has('ManageChannels')) {
+    const recentMembersCount = message.guild!.members.cache.filter(member => {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - ONBOARDING_CONFIG.RECENT_JOINER_DAYS);
+      return !member.user.bot && member.joinedAt && member.joinedAt >= cutoff;
+    }).size;
+
+    const totalMembers = message.guild!.members.cache.filter(member => !member.user.bot).size;
+    const onboardingChannels = message.guild!.channels.cache.filter(ch => 
+      ch.type === ChannelType.GuildText && ch.name.startsWith('onboarding-')
+    ).size;
+
+    const settingsMessage = `⚙️ **Onboarding Configuration**
+
+📊 **Current Stats:**
+• Total non-bot members: \`${totalMembers}\`
+• Recent joiners (last ${ONBOARDING_CONFIG.RECENT_JOINER_DAYS} days): \`${recentMembersCount}\`
+• Existing onboarding channels: \`${onboardingChannels}\`
+
+🔧 **Current Settings:**
+• Recent joiner window: \`${ONBOARDING_CONFIG.RECENT_JOINER_DAYS} days\`
+• Max concurrent processing: \`${ONBOARDING_CONFIG.MAX_CONCURRENT_PROCESSING}\`
+• Batch delay: \`${ONBOARDING_CONFIG.BATCH_DELAY_MS}ms\`
+• Max channels per guild: \`${ONBOARDING_CONFIG.MAX_CHANNELS_PER_GUILD}\`
+
+ℹ️ **Note:** Only members who joined within the last ${ONBOARDING_CONFIG.RECENT_JOINER_DAYS} days will receive onboarding channels to prevent overwhelming large servers.
+
+💡 **Commands:**
+• \`!cleanup-onboarding\` - Clean up old/completed onboarding channels
+• \`!process-recent-members\` - Manually trigger onboarding for recent joiners`;
+
+    await message.reply(settingsMessage);
+    return;
+  }
+
+  // Handle manual processing command
+  if (message.content.startsWith('!process-recent-members') && message.member?.permissions.has('ManageChannels')) {
+    await message.react('⚙️');
+    await message.reply('⚙️ Starting manual onboarding process for recent members...');
+    
+    try {
+      await processExistingMembersForGuild(message.guild!);
+      await message.reply('✅ Manual onboarding process completed! Check logs for details.');
+    } catch (error) {
+      console.error('[MANUAL_ONBOARDING] Error in manual onboarding process:', error);
+      await message.reply('❌ Error occurred during onboarding process. Check logs for details.');
+    }
+    return;
+  }
   
   const guildId = message.guild?.id;
   if (!guildId) return;
@@ -1542,7 +1601,103 @@ async function findOrCreateAvailableOnboardingCategory(guild: Guild): Promise<an
   }
 }
 
-// Optional: Cleanup function to remove old empty onboarding channels
+// Find existing onboarding channel for a user
+async function findExistingOnboardingChannel(member: GuildMember): Promise<TextChannel | null> {
+  try {
+    const guild = member.guild;
+    const expectedChannelName = `onboarding-${member.user.username.toLowerCase().replace(/[^a-z0-9]/g, '')}-${member.user.id.slice(-4)}`;
+    
+    // First, try to find the channel by expected name
+    const channelByName = guild.channels.cache.find(
+      (ch) => ch.name === expectedChannelName && ch.type === ChannelType.GuildText
+    ) as TextChannel | undefined;
+    
+    if (channelByName) {
+      console.log(`[FIND_ONBOARDING] Found existing onboarding channel by name: ${expectedChannelName}`);
+      return channelByName;
+    }
+    
+    // If not found by exact name, search for any channel that starts with the user's prefix
+    const userPrefix = `onboarding-${member.user.username.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+    const channelByPrefix = guild.channels.cache.find(
+      (ch) => ch.name.startsWith(userPrefix) && 
+              ch.name.includes(member.user.id.slice(-4)) &&
+              ch.type === ChannelType.GuildText
+    ) as TextChannel | undefined;
+    
+    if (channelByPrefix) {
+      console.log(`[FIND_ONBOARDING] Found existing onboarding channel by prefix: ${channelByPrefix.name}`);
+      return channelByPrefix;
+    }
+    
+    // Last resort: search by user ID suffix in all onboarding channels
+    const channelByUserIdSuffix = guild.channels.cache.find(
+      (ch) => ch.name.startsWith('onboarding-') && 
+              ch.name.endsWith(`-${member.user.id.slice(-4)}`) &&
+              ch.type === ChannelType.GuildText
+    ) as TextChannel | undefined;
+    
+    if (channelByUserIdSuffix) {
+      console.log(`[FIND_ONBOARDING] Found existing onboarding channel by user ID suffix: ${channelByUserIdSuffix.name}`);
+      return channelByUserIdSuffix;
+    }
+    
+    console.log(`[FIND_ONBOARDING] No existing onboarding channel found for user ${member.user.tag}`);
+    return null;
+    
+  } catch (error) {
+    console.error(`[FIND_ONBOARDING] Error finding existing onboarding channel for user ${member.user.tag}:`, error);
+    return null;
+  }
+}
+
+// Delete an onboarding channel safely
+async function deleteOnboardingChannel(channel: any, userId: string, reason: string): Promise<boolean> {
+  try {
+    // Verify this is actually an onboarding channel
+    if (channel.type !== ChannelType.GuildText || !channel.name.startsWith('onboarding-')) {
+      console.warn(`[DELETE_ONBOARDING] Channel ${channel.name} is not an onboarding channel, skipping deletion`);
+      return false;
+    }
+    
+    // Additional safety check - ensure the channel name contains the user ID
+    if (!channel.name.includes(userId.slice(-4))) {
+      console.warn(`[DELETE_ONBOARDING] Channel ${channel.name} doesn't match user ID ${userId}, skipping deletion`);
+      return false;
+    }
+    
+    console.log(`[DELETE_ONBOARDING] Deleting onboarding channel: ${channel.name} for user ${userId}. Reason: ${reason}`);
+    
+    // Apply rate limiting before deletion
+    await DiscordRateLimiter.channelUpdate(channel.id);
+    
+    // Delete the channel with safe operation
+    const deleted = await safeDiscordOperation(
+      () => channel.delete(reason),
+      'Delete completed onboarding channel',
+      `delete_onboarding_${channel.id}`
+    );
+    
+    if (deleted) {
+      console.log(`[DELETE_ONBOARDING] ✅ Successfully deleted onboarding channel: ${channel.name}`);
+      
+      // Clean up the user's profile collection since onboarding is done
+      userProfileCollections.delete(userId);
+      console.log(`[DELETE_ONBOARDING] Cleaned up profile collection for user ${userId}`);
+      
+      return true;
+    } else {
+      console.error(`[DELETE_ONBOARDING] Failed to delete onboarding channel: ${channel.name}`);
+      return false;
+    }
+    
+  } catch (error) {
+    console.error(`[DELETE_ONBOARDING] Error deleting onboarding channel for user ${userId}:`, error);
+    return false;
+  }
+}
+
+  // Optional: Cleanup function to remove old empty onboarding channels
 async function cleanupOldOnboardingChannels(guild: Guild): Promise<void> {
   try {
     const cutoffDate = new Date();
@@ -1555,6 +1710,7 @@ async function cleanupOldOnboardingChannels(guild: Guild): Promise<void> {
     );
     
     let deletedCount = 0;
+    let completedUserDeletions = 0;
     const MAX_DELETIONS_PER_RUN = 5; // Limit deletions to avoid rate limits
     
     console.log(`[CLEANUP] Found ${onboardingChannels.size} onboarding channels to check`);
@@ -1567,7 +1723,41 @@ async function cleanupOldOnboardingChannels(guild: Guild): Promise<void> {
       
       const textChannel = channel as TextChannel;
       
-      // Check if channel is old and inactive
+      // Extract user ID from channel name (last 4 digits)
+      const userIdMatch = channel.name.match(/-(\d{4})$/);
+      if (userIdMatch) {
+        const userIdSuffix = userIdMatch[1];
+        
+        // Try to find the full user ID by checking guild members
+        const member = guild.members.cache.find(m => m.user.id.endsWith(userIdSuffix));
+        if (member) {
+          // Check if this user has completed onboarding
+          try {
+            const dbProfile = await prisma.discordMember.findFirst({
+              where: { 
+                discordId: member.user.id,
+                discordServerId: guild.id,
+                isOnboarded: true
+              }
+            });
+            
+            if (dbProfile) {
+              // User has completed onboarding, delete their channel
+              console.log(`[CLEANUP] User ${member.user.tag} has completed onboarding, deleting their channel`);
+              const deleted = await deleteOnboardingChannel(textChannel, member.user.id, 'Cleanup: User completed onboarding');
+              if (deleted) {
+                completedUserDeletions++;
+                deletedCount++;
+                continue; // Skip to next channel
+              }
+            }
+          } catch (dbError) {
+            console.error(`[CLEANUP] Error checking onboarding status for user ${member.user.tag}:`, dbError);
+          }
+        }
+      }
+      
+      // Check if channel is old and inactive (existing logic)
       if (channel.createdAt && channel.createdAt < cutoffDate) {
         try {
           // Check if there are recent messages
@@ -1602,9 +1792,13 @@ async function cleanupOldOnboardingChannels(guild: Guild): Promise<void> {
     }
     
     if (deletedCount > 0) {
-      console.log(`[CLEANUP] ✅ Cleanup completed: ${deletedCount} old onboarding channels deleted`);
+      console.log(`[CLEANUP] ✅ Cleanup completed: ${deletedCount} channels deleted total`);
+      if (completedUserDeletions > 0) {
+        console.log(`[CLEANUP] ✅ Deleted ${completedUserDeletions} channels for users who completed onboarding`);
+      }
+      console.log(`[CLEANUP] ✅ Deleted ${deletedCount - completedUserDeletions} old inactive channels`);
     } else {
-      console.log(`[CLEANUP] No old channels found for cleanup`);
+      console.log(`[CLEANUP] No channels found for cleanup`);
     }
     
   } catch (error) {
@@ -2006,7 +2200,7 @@ async function processChannelResponse(message: Message): Promise<void> {
         console.error(`[PROCESS_CHANNEL_STEP3] Error in final save:`, saveError);
       }
       
-      await message.reply(`🎉 **Onboarding Complete!** Thank you for sharing your information.\n\nOur team will review your profile. You can update your info anytime by messaging me again in this channel with new links or details.\n\nWelcome to the community!`);
+      await message.reply(`🎉 **Onboarding Complete!** Thank you for sharing your information.\n\nOur team will review your profile. You can update your info anytime by messaging me again in this channel with new links or details.\n\nWelcome to the community!\n\n⏰ *This channel will be automatically deleted in 30 seconds to keep the server organized.*`);
       
       // Notify founders about the completed profile
       try {
@@ -2015,6 +2209,15 @@ async function processChannelResponse(message: Message): Promise<void> {
       } catch (notifyError) {
         console.error(`[PROCESS_CHANNEL_STEP3] Error notifying founders:`, notifyError);
       }
+      
+      // Delete the onboarding channel after a short delay
+      setTimeout(async () => {
+        try {
+          await deleteOnboardingChannel(message.channel, userId, 'Onboarding completed');
+        } catch (deleteError) {
+          console.error(`[PROCESS_CHANNEL_STEP3] Error deleting onboarding channel for user ${userId}:`, deleteError);
+        }
+      }, 30000); // 30 second delay to allow user to read the completion message
       
       return;
     } else {
@@ -2638,7 +2841,7 @@ export const emergencyControls = {
   checkBeforeOperation: (operationType: string) => EmergencyRateLimitBrake.checkBeforeOperation(operationType)
 };
 
-export { initDiscordBot, cleanupOldOnboardingChannels };
+export { initDiscordBot, cleanupOldOnboardingChannels, deleteOnboardingChannel, findExistingOnboardingChannel };
 
 async function assignContributorRole(
   client: Client,
@@ -3132,6 +3335,14 @@ async function sendWelcomeToExistingMember(member: GuildMember, discordRecord: a
   const existingProfile = userProfileCollections.get(member.user.id);
   if (existingProfile && existingProfile.isComplete) {
     console.log(`[EXISTING_WELCOME_CHANNEL] User ${member.user.id} already has a profile and has completed onboarding`);
+    
+    // Delete their onboarding channel if it exists
+    const existingChannel = await findExistingOnboardingChannel(member);
+    if (existingChannel) {
+      console.log(`[EXISTING_WELCOME_CHANNEL] Deleting onboarding channel for completed user ${member.user.id}`);
+      await deleteOnboardingChannel(existingChannel, member.user.id, 'User already completed onboarding');
+    }
+    
     return false; // Already completed
   }
 
@@ -3145,6 +3356,15 @@ async function sendWelcomeToExistingMember(member: GuildMember, discordRecord: a
       }
     });
     if (dbProfile) {
+      console.log(`[EXISTING_WELCOME_CHANNEL] User ${member.user.id} has completed onboarding in database`);
+      
+      // Delete their onboarding channel if it exists
+      const existingChannel = await findExistingOnboardingChannel(member);
+      if (existingChannel) {
+        console.log(`[EXISTING_WELCOME_CHANNEL] Deleting onboarding channel for DB-completed user ${member.user.id}`);
+        await deleteOnboardingChannel(existingChannel, member.user.id, 'User already completed onboarding (database)');
+      }
+      
       return false; // Already completed onboarding in database
     }
   } catch (error) {
@@ -3258,20 +3478,52 @@ async function processExistingMembersForGuild(guild: Guild): Promise<void> {
       return;
     }
     
-    const members = guild.members.cache.filter(member => !member.user.bot);
-    console.log(`[AUTO_WELCOME] Found ${members.size} non-bot members in guild ${guild.name}`);
+    // Calculate cutoff date for recent joiners using config
+    const recentJoinerCutoff = new Date();
+    recentJoinerCutoff.setDate(recentJoinerCutoff.getDate() - ONBOARDING_CONFIG.RECENT_JOINER_DAYS);
+    
+    // Filter to only recent joiners and exclude bots
+    const recentMembers = guild.members.cache.filter(member => 
+      !member.user.bot && 
+      member.joinedAt && 
+      member.joinedAt >= recentJoinerCutoff
+    );
+    
+    const totalMembers = guild.members.cache.filter(member => !member.user.bot).size;
+    console.log(`[AUTO_WELCOME] Found ${totalMembers} total non-bot members in guild ${guild.name}`);
+    console.log(`[AUTO_WELCOME] Filtering to ${recentMembers.size} members who joined within the last ${ONBOARDING_CONFIG.RECENT_JOINER_DAYS} days`);
+    
+    if (recentMembers.size === 0) {
+      console.log(`[AUTO_WELCOME] No recent joiners found for guild ${guild.name}, skipping onboarding process`);
+      return;
+    }
+
+    // Safety check: Limit maximum channels to create
+    if (recentMembers.size > ONBOARDING_CONFIG.MAX_CHANNELS_PER_GUILD) {
+      console.warn(`[AUTO_WELCOME] Too many recent members (${recentMembers.size}) in guild ${guild.name}. Limiting to ${ONBOARDING_CONFIG.MAX_CHANNELS_PER_GUILD} for safety.`);
+      // Take only the most recent joiners
+      const sortedRecentMembers = Array.from(recentMembers.values())
+        .sort((a, b) => (b.joinedAt?.getTime() || 0) - (a.joinedAt?.getTime() || 0))
+        .slice(0, ONBOARDING_CONFIG.MAX_CHANNELS_PER_GUILD);
+      
+      // Update the collection with limited members
+      recentMembers.clear();
+      sortedRecentMembers.forEach(member => recentMembers.set(member.id, member));
+      
+      console.log(`[AUTO_WELCOME] Limited to ${recentMembers.size} most recent joiners`);
+    }
 
     // Enhanced rate limiting for bulk operations
     let processedCount = 0;
     let successCount = 0;
-    const maxConcurrentProcessing = 3; // Process max 3 members concurrently
-    const memberEntries = Array.from(members.entries());
+    let skippedCount = 0;
+    const memberEntries = Array.from(recentMembers.entries());
     
     // Process members in batches to avoid overwhelming the system
-    for (let i = 0; i < memberEntries.length; i += maxConcurrentProcessing) {
-      const batch = memberEntries.slice(i, i + maxConcurrentProcessing);
+    for (let i = 0; i < memberEntries.length; i += ONBOARDING_CONFIG.MAX_CONCURRENT_PROCESSING) {
+      const batch = memberEntries.slice(i, i + ONBOARDING_CONFIG.MAX_CONCURRENT_PROCESSING);
       
-      console.log(`[AUTO_WELCOME] Processing batch ${Math.floor(i / maxConcurrentProcessing) + 1}/${Math.ceil(memberEntries.length / maxConcurrentProcessing)} (${batch.length} members)`);
+      console.log(`[AUTO_WELCOME] Processing batch ${Math.floor(i / ONBOARDING_CONFIG.MAX_CONCURRENT_PROCESSING) + 1}/${Math.ceil(memberEntries.length / ONBOARDING_CONFIG.MAX_CONCURRENT_PROCESSING)} (${batch.length} recent members)`);
       
       // Process batch members concurrently but with individual rate limiting
       const batchPromises = batch.map(async ([userId, member]) => {
@@ -3279,14 +3531,18 @@ async function processExistingMembersForGuild(guild: Guild): Promise<void> {
           // Apply bulk processing rate limiting
           await DiscordRateLimiter.bulkMemberProcess();
           
+          // Log member join date for debugging
+          const joinedDaysAgo = member.joinedAt ? Math.floor((Date.now() - member.joinedAt.getTime()) / (1000 * 60 * 60 * 24)) : 'unknown';
+          console.log(`[AUTO_WELCOME] Processing ${member.user.tag} (joined ${joinedDaysAgo} days ago)`);
+          
           const sent = await sendWelcomeToExistingMember(member, discordRecord, discordRecord.project);
           if (sent) {
-            return { success: true, member };
+            return { success: true, member, type: 'created' };
           }
-          return { success: false, member };
+          return { success: false, member, type: 'skipped' };
         } catch (error) {
           console.error(`[AUTO_WELCOME] Error processing member ${member.user.tag}:`, error);
-          return { success: false, member, error };
+          return { success: false, member, error, type: 'error' };
         }
       });
 
@@ -3296,22 +3552,28 @@ async function processExistingMembersForGuild(guild: Guild): Promise<void> {
       // Count results
       batchResults.forEach((result) => {
         processedCount++;
-        if (result.status === 'fulfilled' && result.value.success) {
-          successCount++;
+        if (result.status === 'fulfilled') {
+          if (result.value.success) {
+            successCount++;
+          } else if (result.value.type === 'skipped') {
+            skippedCount++;
+          }
         }
       });
 
       // Log progress every batch
-      console.log(`[AUTO_WELCOME] Batch completed. Progress: ${processedCount}/${members.size} processed, ${successCount} channels created`);
+      console.log(`[AUTO_WELCOME] Batch completed. Progress: ${processedCount}/${recentMembers.size} processed, ${successCount} channels created, ${skippedCount} skipped`);
       
       // Longer delay between batches to ensure rate limits are respected
-      if (i + maxConcurrentProcessing < memberEntries.length) {
+      if (i + ONBOARDING_CONFIG.MAX_CONCURRENT_PROCESSING < memberEntries.length) {
         console.log(`[AUTO_WELCOME] Waiting before next batch to respect rate limits...`);
-        await sleep(3000); // 3 second delay between batches
+        await sleep(ONBOARDING_CONFIG.BATCH_DELAY_MS);
       }
     }
 
-    console.log(`[AUTO_WELCOME] ✅ Completed processing for guild ${guild.name}. Processed: ${processedCount}, Channels created: ${successCount}`);
+    console.log(`[AUTO_WELCOME] ✅ Completed processing for guild ${guild.name}.`);
+    console.log(`[AUTO_WELCOME] Stats: ${processedCount} recent members processed, ${successCount} channels created, ${skippedCount} already completed/skipped`);
+    console.log(`[AUTO_WELCOME] Note: Only processed members who joined within the last ${ONBOARDING_CONFIG.RECENT_JOINER_DAYS} days (${recentMembers.size}/${totalMembers} members)`);
 
   } catch (error) {
     console.error(`[AUTO_WELCOME] Error processing existing members for guild ${guild.id}:`, error);
