@@ -328,19 +328,7 @@ function initWebSocketServer(server: http.Server): WebSocketServer {
               );
             }
             break;
-          case 'verify_loom_video':
-            // Verify a Loom video for the project
-            if (data.userId && data.loomVideoUrl) {
-              await handleVerifyLoomVideo(ws, data.userId, data.loomVideoUrl);
-            } else {
-              ws.send(
-                JSON.stringify({
-                  type: 'error',
-                  message: 'User ID and Loom video URL are required',
-                })
-              );
-            }
-            break;
+
           default:
             console.log('Unknown message type:', data.type);
         }
@@ -1332,9 +1320,6 @@ function generateNextLevelRequirementsMessage(currentLevel: number, project: any
       ].join('\n');
 
     case 7:
-      const hasBlogpost = (project.Twitter as any)?.blogpostUrl ? true : false;
-      const hasTwitterThread = (project.Twitter as any)?.twitterThreadUrl ? true : false;
-      
       return [
         `🎉 **Congratulations on completing all levels of the BioDAO onboarding process!**\n`,
         `**Your BioDAO's Current Status:**\n`,
@@ -1701,41 +1686,40 @@ async function handlePotentialActions(
       }
     }
 
-    // Check for Loom video URL if user is at level 7
-    if (project.level === 7) {
-      // Extract Loom video URLs from the message
-      const loomUrls = extractLoomUrls(userMessage);
+    // Check for blogpost URL and Twitter thread URL if user is at level 6
+    if (project.level === 6) {
+      // Extract blogpost URLs (general URLs that aren't Twitter)
+      const blogpostUrls = extractBlogpostUrls(userMessage);
       
-      if (loomUrls.length > 0) {
-        console.log(`Found Loom video URL in message: ${loomUrls[0]}`);
+      if (blogpostUrls.length > 0) {
+        console.log(`Found blogpost URL in message: ${blogpostUrls[0]}`);
         
-        // Process the first Loom video URL (to avoid multiple processing)
+        // Process the first blogpost URL (to avoid multiple processing)
         try {
-          await handleVerifyLoomVideo(ws, userId, loomUrls[0]);
-          actions.push({ action: 'verify_loom_video', success: true });
-          console.log(`Loom video verification processed successfully for user ${userId}`);
+          await handleVerifyBlogpost(ws, userId, blogpostUrls[0]);
+          actions.push({ action: 'verify_blogpost', success: true });
+          console.log(`Blogpost verification processed successfully for user ${userId}`);
         } catch (error) {
-          console.error('Error verifying Loom video:', error);
-          actions.push({ action: 'verify_loom_video', success: false });
+          console.error('Error verifying blogpost:', error);
+          actions.push({ action: 'verify_blogpost', success: false });
         }
       }
-      // Check if user is asking to verify their Loom video
-      else if (
-        userMessage.toLowerCase().includes('verify my loom') ||
-        userMessage.toLowerCase().includes('check my loom') ||
-        userMessage.toLowerCase().includes('verify loom video') ||
-        userMessage.toLowerCase().includes('check loom video') ||
-        userMessage.toLowerCase().includes('verify welcome video') ||
-        userMessage.toLowerCase().includes('submitted loom')
-      ) {
-        ws.send(
-          JSON.stringify({
-            type: 'message',
-            content: `Please share the link to your Loom welcome video so I can verify it. The link should look like "loom.com/share/...".`,
-            isFromAgent: true,
-          })
-        );
-        actions.push({ action: 'request_loom_video', success: true });
+      
+      // Extract Twitter thread URLs
+      const twitterThreadUrls = extractTwitterThreadUrls(userMessage);
+      
+      if (twitterThreadUrls.length > 0) {
+        console.log(`Found Twitter thread URL in message: ${twitterThreadUrls[0]}`);
+        
+        // Process the first Twitter thread URL (to avoid multiple processing)
+        try {
+          await handleVerifyTwitterThread(ws, userId, twitterThreadUrls[0]);
+          actions.push({ action: 'verify_twitter_thread', success: true });
+          console.log(`Twitter thread verification processed successfully for user ${userId}`);
+        } catch (error) {
+          console.error('Error verifying Twitter thread:', error);
+          actions.push({ action: 'verify_twitter_thread', success: false });
+        }
       }
     }
 
@@ -2903,7 +2887,7 @@ async function checkAndPerformLevelUp(project: any, ws: WebSocket): Promise<void
           
           newLevel = 7;
           shouldLevelUp = true;
-          levelUpMessage = `🎉 **Congratulations on reaching Level 7!**\n\nYou've successfully articulated your BioDAO's vision through both a comprehensive blogpost and an engaging Twitter thread. This is the final level of the BioDAO onboarding process.\n\nTo complete the entire onboarding process, you need to:\n- Record a welcome Loom video for new members\n- Share the vision of your DAO\n- Post it on Discord and share the link with me`;
+          levelUpMessage = `🎉 **Congratulations on reaching Level 7!**\n\nYou've successfully articulated your BioDAO's vision through both a comprehensive blogpost and an engaging Twitter thread. This is the final level of the BioDAO onboarding process.\n\nYour BioDAO is now fully established! You have completed all onboarding requirements. The Bio team will be in touch regarding next steps and opportunities within the ecosystem.`;
         } else {
           const missingReqs = [];
           if (!hasBlogpost) missingReqs.push('visionary blogpost');
@@ -2916,43 +2900,8 @@ async function checkAndPerformLevelUp(project: any, ws: WebSocket): Promise<void
         break;
         
       case 7:
-        // Check for Loom video completion
-        const hasLoomVideo = (project.Twitter as any)?.loomVideoUrl ? true : false;
-        
-        if (hasLoomVideo) {
-          // Check if we've recently sent this level-up notification
-          if (wasLevelUpRecentlySent(project.id, 8)) {
-            console.log(`Skipping duplicate level completion notification for user ${project.id} (sent recently)`);
-            return;
-          }
-          
-          // We don't increment the level, but we send a special completion message
-          levelUpMessage = `🎉 **Congratulations on completing the BioDAO onboarding process!**\n\nYou've successfully completed all requirements, including:\n- Minting your scientific NFTs\n- Building a Discord community\n- Sharing scientific content\n- Connecting your Twitter presence\n- Building a verified scientific membership\n- Articulating your vision through blog and Twitter\n- Creating a welcome video for new members\n\nThe Bio team will reach out to discuss next steps and opportunities within the ecosystem.`;
-          
-          // Record this special completion notification
-          recordLevelUpSent(project.id, 8);
-          
-          // Send a chat message with the completion notification
-          const sessionId = await getOrCreateChatSession(project.id);
-          await saveChatMessage(sessionId, levelUpMessage, true, 'ONBOARDING_COMPLETE', true);
-          
-          // Send the WebSocket message
-          ws.send(
-            JSON.stringify({
-              type: 'message',
-              content: levelUpMessage,
-              isFromAgent: true,
-              action: 'ONBOARDING_COMPLETE'
-            })
-          );
-          
-          console.log(`Project ${project.id} has completed all onboarding requirements!`);
-          return; // Return early as we don't need to do a level up
-        } else {
-          console.log(
-            `Project ${project.id} hasn't completed the Loom video requirement yet`
-          );
-        }
+        // Level 7 is the final level - no further level-up needed
+        console.log(`Project ${project.id} is at the final level (Level 7)`);
         break;
 
       default:
@@ -4556,6 +4505,57 @@ async function handleVerifyLoomVideo(
       })
     );
   }
+}
+
+/**
+ * Extract blogpost URLs from a message (general URLs that aren't Twitter/X)
+ * @param message User message
+ * @returns Array of blogpost URLs found in the message
+ */
+function extractBlogpostUrls(message: string): string[] {
+  const blogpostUrls: string[] = [];
+  
+  // Regular expression to match general URLs
+  const urlRegex = /https?:\/\/[^\s]+/g;
+  
+  // Find all matches
+  const matches = message.match(urlRegex);
+  
+  if (matches) {
+    // Filter out Twitter/X URLs and duplicates
+    const nonTwitterUrls = matches.filter(url => 
+      !url.includes('twitter.com') && 
+      !url.includes('x.com') &&
+      !url.includes('loom.com')
+    );
+    const uniqueUrls = [...new Set(nonTwitterUrls)];
+    blogpostUrls.push(...uniqueUrls);
+  }
+  
+  return blogpostUrls;
+}
+
+/**
+ * Extract Twitter thread URLs from a message
+ * @param message User message
+ * @returns Array of Twitter thread URLs found in the message
+ */
+function extractTwitterThreadUrls(message: string): string[] {
+  const twitterThreadUrls: string[] = [];
+  
+  // Regular expressions to match Twitter URLs (same as tweet URLs since threads are also tweets)
+  const twitterRegex = /https?:\/\/(www\.)?(twitter|x)\.com\/[a-zA-Z0-9_]+\/status\/\d+/g;
+  
+  // Find all matches
+  const matches = message.match(twitterRegex);
+  
+  if (matches) {
+    // Filter out duplicates
+    const uniqueUrls = [...new Set(matches)];
+    twitterThreadUrls.push(...uniqueUrls);
+  }
+  
+  return twitterThreadUrls;
 }
 
 /**
