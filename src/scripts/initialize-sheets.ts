@@ -1,17 +1,22 @@
 /**
- * Google Sheets Initialization Script
+ * Google Sheets Initialization & Data Sync Script
  * 
- * This script initializes or refreshes the Google Sheet with project data from the database.
+ * This script can:
+ * 1. Initialize the Google Sheet structure (create sheet, headers, formatting)
+ * 2. Sync project data from the database to the sheet
  * 
  * Usage:
- * - To sync all projects: npm run initialize-sheets
- * - To sync a specific project: npm run initialize-sheets -- --project=<project-id>
+ * - Setup sheet structure only: npm run initialize-sheets -- --setup-only
+ * - Sync all projects (includes setup): npm run initialize-sheets
+ * - Sync all projects (data only): npm run initialize-sheets -- --sync-only
+ * - Sync specific project: npm run initialize-sheets -- --project=<project-id>
+ * - Full initialization + data sync: npm run initialize-sheets -- --full
  * 
  * Environment variables:
- * - INITIALIZE_SHEET: Set to 'true' to run the initialization (safety measure)
+ * - INITIALIZE_SHEET: Set to 'true' to run the script (safety measure)
  */
 
-import dotenv from 'dotenv';
+import * as dotenv from 'dotenv';
 import { initializeSheetWithAllProjects, syncProjectToSheets } from '../services/sheets-sync.service';
 import { getGoogleAccessToken } from '../services/sheets-sync.service';
 import axios from 'axios';
@@ -24,20 +29,106 @@ const SHEET_NAME = 'Projects';
 
 // Expected columns structure
 const EXPECTED_COLUMNS = [
-  "id", "level", "projectName","test", "projectDescription", "projectVision", 
+  "id", "level", "projectName","Test", "projectDescription", "projectVision", 
   "projectLinks", "referralSource", "scientificReferences", "credentialLinks", 
   "teamMembers", "motivation", "progress", 
   "id (Discord)", "serverId", "serverName", "invitationUrl",
   "messagesCount", "papersShared", "qualityScore", "memberCount", "lastActivity"
 ];
 
+// Parse command line arguments
+function parseArguments(): {
+  mode: 'setup-only' | 'sync-only' | 'full' | 'specific-project';
+  projectId?: string;
+  help?: boolean;
+} {
+  const args = process.argv.slice(2);
+  
+  if (args.includes('--help') || args.includes('-h')) {
+    return { mode: 'full', help: true };
+  }
+  
+  if (args.includes('--setup-only')) {
+    return { mode: 'setup-only' };
+  }
+  
+  if (args.includes('--sync-only')) {
+    return { mode: 'sync-only' };
+  }
+  
+  const projectArg = args.find(arg => arg.startsWith('--project='));
+  if (projectArg) {
+    const projectId = projectArg.split('=')[1];
+    if (!projectId) {
+      throw new Error('Project ID is required when using --project flag');
+    }
+    return { mode: 'specific-project', projectId };
+  }
+  
+  // Default mode is full initialization + sync
+  return { mode: 'full' };
+}
+
+// Display help information
+function showHelp(): void {
+  console.log(`
+Google Sheets Initialization & Data Sync Script
+
+Usage:
+  npm run initialize-sheets [options]
+
+Options:
+  --setup-only          Initialize sheet structure only (headers, formatting)
+  --sync-only          Sync data only (assumes sheet structure exists)  
+  --full               Full initialization + data sync (default)
+  --project=<id>       Sync specific project by ID
+  --help, -h           Show this help message
+
+Environment Variables:
+  INITIALIZE_SHEET     Must be set to 'true' to run the script
+
+Examples:
+  npm run initialize-sheets                           # Full setup + sync all projects
+  npm run initialize-sheets -- --setup-only          # Setup sheet structure only
+  npm run initialize-sheets -- --sync-only           # Sync all project data only
+  npm run initialize-sheets -- --project=abc123      # Sync specific project
+  npm run initialize-sheets -- --full                # Explicit full initialization
+`);
+}
+
 /**
- * Initialize Google Sheets for BioDAO project tracking
+ * Sync project data to Google Sheets
+ * - Syncs all projects or a specific project
+ * - Uses the sheets-sync service functions
+ */
+async function syncProjectData(projectId?: string): Promise<void> {
+  try {
+    console.log('[SYNC] Starting project data synchronization');
+    
+    if (projectId) {
+      console.log(`[SYNC] Syncing specific project: ${projectId}`);
+      const result = await syncProjectToSheets(projectId);
+      console.log(`[SYNC] Result: ${result}`);
+    } else {
+      console.log('[SYNC] Syncing all projects from database');
+      const result = await initializeSheetWithAllProjects();
+      console.log(`[SYNC] Result: ${result}`);
+    }
+    
+    console.log('[SYNC] Project data synchronization complete!');
+  } catch (error) {
+    console.error('[SYNC] Data synchronization failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Initialize Google Sheets structure for BioDAO project tracking
  * - Verifies spreadsheet access
  * - Creates Projects sheet if it doesn't exist
- * - Sets up column headers
+ * - Sets up column headers and formatting
  */
-async function initializeSheets(): Promise<void> {
+async function initializeSheetStructure(): Promise<void> {
   try {
     console.log('[INITIALIZE] Starting Google Sheets initialization');
     
@@ -192,9 +283,63 @@ async function initializeSheets(): Promise<void> {
   }
 }
 
-// Run the initialization
-if (require.main === module) {
-  initializeSheets().catch(console.error);
+/**
+ * Main function to handle different execution modes
+ */
+async function main(): Promise<void> {
+  try {
+    // Check for safety environment variable
+    if (process.env.INITIALIZE_SHEET !== 'true') {
+      console.error('ERROR: INITIALIZE_SHEET environment variable must be set to "true" to run this script');
+      console.error('This is a safety measure to prevent accidental execution');
+      console.error('Usage: INITIALIZE_SHEET=true npm run initialize-sheets');
+      process.exit(1);
+    }
+
+    const { mode, projectId, help } = parseArguments();
+    
+    if (help) {
+      showHelp();
+      return;
+    }
+
+    console.log(`[MAIN] Running in mode: ${mode}`);
+    
+    switch (mode) {
+      case 'setup-only':
+        await initializeSheetStructure();
+        break;
+        
+      case 'sync-only':
+        await syncProjectData(projectId);
+        break;
+        
+      case 'specific-project':
+        if (!projectId) {
+          throw new Error('Project ID is required for specific project sync');
+        }
+        console.log(`[MAIN] Syncing specific project: ${projectId}`);
+        await syncProjectData(projectId);
+        break;
+        
+      case 'full':
+      default:
+        console.log('[MAIN] Running full initialization and data sync');
+        await initializeSheetStructure();
+        await syncProjectData();
+        break;
+    }
+    
+    console.log('[MAIN] Script completed successfully!');
+  } catch (error) {
+    console.error('[MAIN] Script failed:', error);
+    process.exit(1);
+  }
 }
 
-export { initializeSheets }; 
+// Run the script
+if (require.main === module) {
+  main().catch(console.error);
+}
+
+export { initializeSheetStructure, syncProjectData, main }; 

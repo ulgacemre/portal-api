@@ -15,6 +15,7 @@
     "initialize-sheets": "ts-node src/scripts/initialize-sheets.ts",
     "setup-sheets-db": "ts-node src/scripts/setup-sheets-db-triggers.ts",
     "process-sheets-queue": "ts-node src/scripts/process-sheets-sync-queue.ts",
+    "test:sheets-validation": "ts-node src/scripts/test-sheets-validation.ts",
     "update-last-activity": "ts-node src/scripts/update-last-activity.ts",
     "check-db": "ts-node src/scripts/check-db-schema.ts",
     "check-google": "ts-node src/scripts/check-google-credentials.ts",

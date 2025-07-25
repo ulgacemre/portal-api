@@ -943,8 +943,9 @@ async function validateSpreadsheetColumns(accessToken: string, forceRefresh = fa
   forceRevalidation = false;
   
   try {
-    // Fetch the header row
-    const headerRange = `${SHEET_NAME}!A1:U1`;
+    // Fetch the header row - use a wider range to account for potentially more columns than expected
+    const maxColumnLetter = String.fromCharCode('A'.charCodeAt(0) + Math.max(EXPECTED_COLUMN_STRUCTURE.length, 25));
+    const headerRange = `${SHEET_NAME}!A1:${maxColumnLetter}1`;
     const url = `${GOOGLE_SHEETS_API_ENDPOINT}/${SPREADSHEET_ID}/values/${headerRange}`;
     
     const response = await axios.get(url, {
@@ -1030,11 +1031,60 @@ async function validateSpreadsheetColumns(accessToken: string, forceRefresh = fa
       }
       
       console.log(`[SHEETS_VALIDATE] Successfully added all missing columns`);
+      
+      // Re-fetch the header row after adding columns to get the updated data
+      console.log(`[SHEETS_VALIDATE] Re-fetching header row to include newly added columns...`);
+      const newLastColumnLetter = String.fromCharCode('A'.charCodeAt(0) + lastColIndex + missingColumns.length - 1);
+      const updatedHeaderRange = `${SHEET_NAME}!A1:${newLastColumnLetter}1`;
+      const updatedHeaderUrl = `${GOOGLE_SHEETS_API_ENDPOINT}/${SPREADSHEET_ID}/values/${updatedHeaderRange}`;
+      
+      try {
+        const updatedResponse = await axios.get(updatedHeaderUrl, {
+          headers: { Authorization: `Bearer ${accessToken}` }
+        });
+        
+        const updatedHeaderRow = updatedResponse.data.values?.[0];
+        if (updatedHeaderRow && updatedHeaderRow.length > headerRow.length) {
+          // Replace the original header row with the updated one
+          headerRow.length = 0; // Clear the original array
+          headerRow.push(...updatedHeaderRow); // Add all elements from updated array
+          console.log(`[SHEETS_VALIDATE] Updated header row with ${headerRow.length} columns`);
+          console.log(`[SHEETS_VALIDATE] New header row: ${JSON.stringify(headerRow)}`);
+        } else {
+          console.warn(`[SHEETS_VALIDATE] Warning: Updated header row doesn't seem to include new columns`);
+        }
+      } catch (refetchError) {
+        console.error(`[SHEETS_VALIDATE] Error re-fetching header row after adding columns:`, refetchError);
+        // Continue with validation using cached indices, but log the issue
+        console.warn(`[SHEETS_VALIDATE] Continuing with cached column indices despite refetch error`);
+      }
     }
     
     if (hasColumnOrderMismatch) {
       console.warn(`[SHEETS_VALIDATE] Column order mismatches detected: ${columnOrderMismatches.join('; ')}`);
       console.warn(`[SHEETS_VALIDATE] Using actual column positions instead of expected positions.`);
+    }
+    
+    // If we added missing columns, recalculate column indices using the updated header row
+    if (hasMissingColumns) {
+      console.log(`[SHEETS_VALIDATE] Recalculating column indices with updated header row...`);
+      
+      // Clear and rebuild columnIndices mapping with the updated header
+      Object.keys(columnIndices).forEach(key => delete columnIndices[key]);
+      
+      EXPECTED_COLUMN_STRUCTURE.forEach((expectedColumn, expectedIndex) => {
+        const actualIndex = headerRow.findIndex(
+          (header: string) => header && header.trim().toLowerCase() === expectedColumn.toLowerCase()
+        );
+        
+        if (actualIndex !== -1) {
+          columnIndices[expectedColumn] = actualIndex;
+        } else {
+          console.error(`[SHEETS_VALIDATE] Still missing column after update: ${expectedColumn}`);
+        }
+      });
+      
+      console.log(`[SHEETS_VALIDATE] Recalculated column indices:`, columnIndices);
     }
     
     // Map critical Discord metrics to their validated indices and verify positions
@@ -1052,14 +1102,29 @@ async function validateSpreadsheetColumns(accessToken: string, forceRefresh = fa
     console.log('[SHEETS_VALIDATE] Critical Discord column positions:');
     for (const metric of Object.keys(discordMetricIndices)) {
       const columnIndex = columnIndices[metric];
+      
+      if (columnIndex === undefined) {
+        console.error(`[SHEETS_VALIDATE] CRITICAL ERROR: Column index not found for metric: ${metric}`);
+        forceRevalidation = true;
+        throw new Error(`Critical error: Column index not found for metric: ${metric}`);
+      }
+      
       const columnLetter = String.fromCharCode('A'.charCodeAt(0) + columnIndex);
       console.log(`  ${metric}: Column ${columnLetter} (index ${columnIndex})`);
       
       // Sanity check - ensure the actual column header at this position contains our metric name
       const actualHeader = headerRow[columnIndex];
-      if (!actualHeader || !actualHeader.toLowerCase().includes(metric.toLowerCase())) {
+      console.log(`  Checking header at index ${columnIndex}: "${actualHeader}"`);
+      
+      if (!actualHeader) {
+        console.error(`[SHEETS_VALIDATE] CRITICAL MISMATCH: Column ${columnLetter} (index ${columnIndex}) is empty/undefined for metric ${metric}`);
+        console.error(`[SHEETS_VALIDATE] Header row length: ${headerRow.length}, trying to access index: ${columnIndex}`);
+        console.error(`[SHEETS_VALIDATE] Full header row: ${JSON.stringify(headerRow)}`);
+        forceRevalidation = true; 
+        throw new Error(`Critical column mismatch: Column ${columnLetter} is empty for metric ${metric}. Header row length: ${headerRow.length}, accessed index: ${columnIndex}`);
+      } else if (!actualHeader.toLowerCase().includes(metric.toLowerCase())) {
         console.error(`[SHEETS_VALIDATE] CRITICAL MISMATCH: Column ${columnLetter} is supposed to be ${metric} but found "${actualHeader}" instead`);
-        forceRevalidation = true; // Force revalidation on next operation
+        forceRevalidation = true; 
         throw new Error(`Critical column mismatch: Expected ${metric} at column ${columnLetter} but found "${actualHeader}"`);
       } else {
         console.log(`  ✓ Verified column ${columnLetter} contains "${actualHeader}"`);
